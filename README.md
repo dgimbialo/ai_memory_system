@@ -10,7 +10,7 @@ It **remembers decisions, tracks bugs and features, detects contradictions** bet
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  VS Code  (Agent mode)                                       │
+│  VS Code  (Agent mode)                                      │
 │                                                             │
 │  SessionStart hook ──► context_injector.py                  │
 │      └─ injects project memory summary as systemMessage     │
