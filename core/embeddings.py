@@ -1,0 +1,72 @@
+"""Embeddings module with graceful fallback.
+
+Uses sentence-transformers (all-MiniLM-L6-v2) when available; otherwise falls
+back to a deterministic hashing-based bag-of-words vector so the system stays
+functional in offline / no-dependency environments.
+"""
+from __future__ import annotations
+
+import math
+import re
+from typing import List, Optional
+
+_MODEL = None
+_BACKEND = None  # "st" or "fallback"
+
+
+def _load_model():
+    global _MODEL, _BACKEND
+    if _BACKEND is not None:
+        return _MODEL
+    try:
+        from sentence_transformers import SentenceTransformer  # type: ignore
+        _MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+        _BACKEND = "st"
+    except Exception:
+        _MODEL = None
+        _BACKEND = "fallback"
+    return _MODEL
+
+
+_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
+
+
+def _hash_embed(text: str, dim: int = 256) -> List[float]:
+    vec = [0.0] * dim
+    tokens = _TOKEN_RE.findall((text or "").lower())
+    if not tokens:
+        return vec
+    for tok in tokens:
+        h = hash(tok) % dim
+        vec[h] += 1.0
+    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+    return [v / norm for v in vec]
+
+
+def embed(text: str) -> List[float]:
+    model = _load_model()
+    if model is not None:
+        try:
+            v = model.encode(text or "", normalize_embeddings=True)
+            return [float(x) for x in v]
+        except Exception:
+            pass
+    return _hash_embed(text or "")
+
+
+def cosine(a: List[float], b: List[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a)) or 1.0
+    nb = math.sqrt(sum(y * y for y in b)) or 1.0
+    return dot / (na * nb)
+
+
+def similarity(text_a: str, text_b: str) -> float:
+    return cosine(embed(text_a), embed(text_b))
+
+
+def backend() -> str:
+    _load_model()
+    return _BACKEND or "fallback"

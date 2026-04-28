@@ -1,0 +1,5 @@
+# Optional: higher-quality semantic similarity
+sentence-transformers>=2.2.0
+
+# Optional: efficient file watching for daemon mode
+watchdog>=3.0.0

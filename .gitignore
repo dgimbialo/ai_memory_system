@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# AI Memory System — runtime data (do NOT commit real project memory)
+data/memory.json
+data/wiki.json
+data/conflicts.json
+data/activity_log.json
+data/copilot_activity.json
+data/learn_log.json
+data/managed_projects.json
+data/.copilot_log_cursors.json
+data/.backups/
+data/wiki/
+data/projects/
+
+# Keep the data/ directory itself (bootstrap creates it)
+!data/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db

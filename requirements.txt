@@ -1,0 +1,13 @@
+# AI Memory System — dependencies
+#
+# Core functionality requires NO third-party packages (pure stdlib).
+# Install optional packages for enhanced features:
+
+# Higher-quality semantic similarity (recommended)
+# sentence-transformers>=2.2.0
+
+# Efficient file watching for daemon mode (recommended)
+# watchdog>=3.0.0
+
+# Already available in Python 3.10+ stdlib:
+#   pathlib, json, hashlib, argparse, threading, re, datetime
