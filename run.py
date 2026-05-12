@@ -52,11 +52,23 @@ def cmd_add_memory(args: argparse.Namespace) -> int:
         "cause": args.cause or "",
         "fix": args.fix or "",
         "files": args.files or [],
+        "functions": args.functions or [],
+        "decisions": args.decisions or [],
         "status": args.status,
         "confidence": args.confidence,
         "tags": tags,
     }
     result = _engine(args.project).add_memory(payload)
+    _print(result)
+    return 0
+
+
+def cmd_session_summary(args: argparse.Namespace) -> int:
+    result = _engine(args.project).session_summary(
+        description=args.description,
+        tags=list(args.tags or []),
+        since_n=args.since_n,
+    )
     _print(result)
     return 0
 
@@ -74,7 +86,15 @@ def cmd_detect_conflicts(args: argparse.Namespace) -> int:
 
 
 def cmd_query_memory(args: argparse.Namespace) -> int:
-    results = _engine(args.project).query_memory(args.query, top_k=args.top_k)
+    # Support both positional 'query' and --query flag
+    q_text = getattr(args, 'query_text', None) or getattr(args, 'query', None) or ''
+    results = _engine(args.project).query_memory(
+        q_text,
+        top_k=args.top_k,
+        filter_file=getattr(args, 'filter_file', None),
+        filter_function=getattr(args, 'filter_function', None),
+        fmt=getattr(args, 'format', 'concise'),
+    )
     _print(results)
     return 0
 
@@ -111,6 +131,16 @@ def cmd_lint(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def cmd_update_instructions(args: argparse.Namespace) -> int:
+    result = _engine(args.project).update_instructions(
+        project_path=args.project_path,
+        min_confidence=args.min_confidence,
+        dry_run=args.dry_run,
+    )
+    _print(result)
+    return 0
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="ai_memory_system", description="Persistent AI memory CLI")
     p.add_argument(
@@ -129,10 +159,26 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--cause", default="")
     a.add_argument("--fix", default="")
     a.add_argument("--files", nargs="*", default=[])
-    a.add_argument("--status", default="active", choices=["active", "resolved", "conflict"])
+    a.add_argument("--functions", nargs="*", default=[],
+                   help="Specific functions/methods changed (more granular than --files)")
+    a.add_argument("--decisions", nargs="*", default=[],
+                   help="Key architectural decisions with rationale (WHY, not just WHAT)")
+    a.add_argument("--status", default="active", choices=["active", "resolved", "conflict", "superseded"])
     a.add_argument("--confidence", type=float, default=0.5)
     a.add_argument("--tags", nargs="*", default=[])
     a.set_defaults(func=cmd_add_memory)
+
+    ss = sub.add_parser(
+        "session_summary",
+        help="Create a single summary entry for the current session "
+             "(aggregates files/functions from recent entries)",
+    )
+    ss.add_argument("--description", required=True,
+                    help="One-line summary of what this session accomplished")
+    ss.add_argument("--tags", nargs="*", default=[])
+    ss.add_argument("--since-n", dest="since_n", type=int, default=20,
+                    help="How many recent entries to aggregate (default: 20)")
+    ss.set_defaults(func=cmd_session_summary)
 
     l = sub.add_parser("list_memory", help="List memory entries")
     l.add_argument("--type", default=None)
@@ -143,8 +189,18 @@ def build_parser() -> argparse.ArgumentParser:
     d.set_defaults(func=cmd_detect_conflicts)
 
     q = sub.add_parser("query_memory", help="Semantic query over memory")
-    q.add_argument("query")
+    q.add_argument("query", nargs='?', default=None,
+                   help="Query text (positional, or use --query)")
+    q.add_argument("--query", dest="query_text", default=None,
+                   metavar="TEXT",
+                   help="Query text (alternative to positional argument)")
     q.add_argument("--top-k", type=int, default=5)
+    q.add_argument("--file", dest="filter_file", default=None,
+                   help="Filter results to entries touching this file (substring match)")
+    q.add_argument("--function", dest="filter_function", default=None,
+                   help="Filter results to entries touching this function")
+    q.add_argument("--format", default="concise", choices=["concise", "full"],
+                   help="Output format: concise (decisions+summary) or full JSON")
     q.set_defaults(func=cmd_query_memory)
 
     s = sub.add_parser("state", help="Show engine state summary")
@@ -152,7 +208,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     us = sub.add_parser("update_status", help="Update an entry's status")
     us.add_argument("--id", required=True)
-    us.add_argument("--status", required=True, choices=["active", "resolved", "conflict"])
+    us.add_argument("--status", required=True, choices=["active", "resolved", "conflict", "superseded"])
     us.add_argument("--reason", default="")
     us.set_defaults(func=cmd_update_status)
 
@@ -164,6 +220,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     rw = sub.add_parser("render_wiki", help="Render markdown wiki under data/wiki/")
     rw.set_defaults(func=cmd_render_wiki)
+
+    ui = sub.add_parser(
+        "update_instructions",
+        help="Generate Learned Patterns from decisions and update copilot-instructions.md",
+    )
+    ui.add_argument(
+        "--project-path", dest="project_path", required=True,
+        help="Path to the project root (must contain .github/copilot-instructions.md)",
+    )
+    ui.add_argument(
+        "--min-confidence", dest="min_confidence", type=float, default=0.8,
+        help="Minimum confidence to include (default: 0.8)",
+    )
+    ui.add_argument(
+        "--dry-run", dest="dry_run", action="store_true", default=False,
+        help="Print content without writing to disk",
+    )
+    ui.set_defaults(func=cmd_update_instructions)
 
     ln = sub.add_parser("lint", help="Health-check the memory store")
     ln.add_argument("--stale-days", type=int, default=180,

@@ -103,11 +103,27 @@ def render_entry_page(entry: Dict[str, Any]) -> str:
     if entry.get("fix"):
         lines += ["## Fix", entry["fix"].strip(), ""]
 
+    # Key decisions (WHY — most valuable for future sessions)
+    decisions = entry.get("decisions") or []
+    if decisions:
+        lines.append("## Key Decisions")
+        for d in decisions:
+            lines.append(f"- {d}")
+        lines.append("")
+
     files = entry.get("files") or []
     if files:
         lines.append("## Affected Files")
         for f in files:
             lines.append(f"- [[files/{_slug(f)}|{f}]]")
+        lines.append("")
+
+    # Changed functions (more granular than files)
+    functions = entry.get("functions") or []
+    if functions:
+        lines.append("## Changed Functions")
+        for fn in functions:
+            lines.append(f"- `{fn}`")
         lines.append("")
 
     conflicts = entry.get("conflicts_with") or []

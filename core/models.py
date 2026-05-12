@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 
 VALID_TYPES = {"bug_fix", "feature", "note", "decision"}
-VALID_STATUS = {"active", "resolved", "conflict"}
+VALID_STATUS = {"active", "resolved", "conflict", "superseded"}
 
 
 def _utcnow() -> str:
@@ -26,6 +26,10 @@ class MemoryEntry:
     cause: str = ""
     fix: str = ""
     files: List[str] = field(default_factory=list)
+    # New: specific functions / methods changed (more granular than files)
+    functions: List[str] = field(default_factory=list)
+    # New: key architectural decisions with rationale (why, not just what)
+    decisions: List[str] = field(default_factory=list)
     status: str = "active"
     confidence: float = 0.5
     timestamp: str = field(default_factory=_utcnow)
@@ -43,6 +47,10 @@ class MemoryEntry:
             raise ValueError("description is required")
         if not isinstance(self.files, list):
             raise ValueError("files must be a list")
+        if not isinstance(self.functions, list):
+            raise ValueError("functions must be a list")
+        if not isinstance(self.decisions, list):
+            raise ValueError("decisions must be a list")
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -51,6 +59,9 @@ class MemoryEntry:
     def from_dict(cls, data: Dict[str, Any]) -> "MemoryEntry":
         allowed = {f for f in cls.__dataclass_fields__}
         clean = {k: v for k, v in data.items() if k in allowed}
+        # Back-compat: entries saved before functions/decisions fields existed
+        clean.setdefault("functions", [])
+        clean.setdefault("decisions", [])
         return cls(**clean)
 
 

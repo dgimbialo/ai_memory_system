@@ -136,19 +136,77 @@ class MemoryEngine:
         )
         return [c.to_dict() for c in conflicts]
 
-    def query_memory(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def query_memory(
+        self,
+        query: str,
+        top_k: int = 5,
+        filter_file: Optional[str] = None,
+        filter_function: Optional[str] = None,
+        fmt: str = "concise",
+    ) -> List[Dict[str, Any]]:
+        """Semantic search over memory entries.
+
+        Args:
+            query:           Natural-language query string.
+            top_k:           Max results to return.
+            filter_file:     If set, only return entries touching files that contain
+                             this substring (e.g. 'RecordCorrection').
+            filter_function: If set, only return entries where the functions list
+                             contains this substring.
+            fmt:             'concise' returns a lightweight summary focused on
+                             decisions and description; 'full' returns the full entry.
+        """
         memory = self._read_memory()
+
+        # Apply file / function pre-filters
+        if filter_file:
+            memory = [
+                e for e in memory
+                if any(filter_file.lower() in f.lower() for f in e.get("files", []))
+            ]
+        if filter_function:
+            memory = [
+                e for e in memory
+                if any(filter_function.lower() in fn.lower()
+                       for fn in e.get("functions", []))
+            ]
+
         scored: List[tuple[float, Dict[str, Any]]] = []
         for e in memory:
-            text = " ".join(
-                filter(None, [e.get("description", ""), e.get("cause", ""), e.get("fix", "")])
-            )
+            # Index over description + cause + fix + decisions for richer matching
+            decisions_text = " ".join(e.get("decisions", []))
+            text = " ".join(filter(None, [
+                e.get("description", ""),
+                e.get("cause", ""),
+                e.get("fix", ""),
+                decisions_text,
+            ]))
             score = similarity(query, text)
             scored.append((score, e))
+
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [
-            {"score": round(float(s), 4), "entry": e} for s, e in scored[:top_k]
-        ]
+        top = scored[:top_k]
+
+        if fmt == "concise":
+            return [
+                {
+                    "score":       round(float(s), 4),
+                    "id":          e["id"],
+                    "type":        e.get("type", ""),
+                    "status":      e.get("status", ""),
+                    "description": e.get("description", ""),
+                    "decisions":   e.get("decisions", []),
+                    "fix_summary": (e.get("fix") or "")[:200],
+                    "files":       e.get("files", []),
+                    "functions":   e.get("functions", []),
+                    "tags":        [t for t in e.get("tags", [])
+                                    if not t.startswith("project:")],
+                }
+                for s, e in top
+            ]
+
+        # fmt == 'full'
+        return [{"score": round(float(s), 4), "entry": e} for s, e in top]
 
     def update_status(self, entry_id: str, status: str, reason: str = "") -> Dict[str, Any]:
         memory = self._read_memory()
@@ -191,3 +249,155 @@ class MemoryEngine:
             ),
         )
         return report
+
+
+    # ---------- update copilot-instructions.md ----------
+
+    def update_instructions(
+        self,
+        project_path: str,
+        min_confidence: float = 0.80,
+        dry_run: bool = False,
+    ) -> dict:
+        """Generate a Learned Patterns section from high-confidence decisions
+        and write it into the project's .github/copilot-instructions.md.
+
+        Only entries with:
+          - status == "active"
+          - confidence >= min_confidence
+          - at least one non-empty decision string
+        are included.
+
+        Args:
+            project_path:   Root of the project (must contain .github/).
+            min_confidence: Minimum confidence score to include (default 0.80).
+            dry_run:        If True, return the generated content without writing.
+
+        Returns a dict with keys: patterns_count, content, updated (bool).
+        """
+        from pathlib import Path as _Path
+        from .vscode_infra import VSCodeInfraBuilder
+
+        memory = self._read_memory()
+
+        # Collect decisions from qualifying entries
+        patterns: list[str] = []
+        for e in memory:
+            if e.get("status") not in ("active",):
+                continue
+            if float(e.get("confidence", 0)) < min_confidence:
+                continue
+            decisions = e.get("decisions") or []
+            for d in decisions:
+                d = d.strip()
+                if d and d not in patterns:
+                    patterns.append(d)
+
+        if not patterns:
+            return {
+                "patterns_count": 0,
+                "content": "",
+                "updated": False,
+                "reason": "no qualifying decisions found (min_confidence={})".format(min_confidence),
+            }
+
+        # Build section content
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        lines = [
+            "<!-- Auto-generated from AI Memory System decisions on {} -->".format(now),
+            "",
+        ]
+        for p in patterns:
+            # Normalise to a single-line bullet
+            single = " ".join(p.split())
+            lines.append("- {}".format(single))
+        lines.append("")
+        section_content = "\n".join(lines)
+
+        if dry_run:
+            return {
+                "patterns_count": len(patterns),
+                "content": section_content,
+                "updated": False,
+                "dry_run": True,
+            }
+
+        builder = VSCodeInfraBuilder(self.storage.data_dir)
+        updated = builder.update_instructions(
+            project_path, "Learned Patterns", section_content
+        )
+
+        self._log(
+            "update_instructions",
+            [],
+            "wrote {} pattern(s) to {}" .format(len(patterns), project_path),
+        )
+
+        return {
+            "patterns_count": len(patterns),
+            "content": section_content,
+            "updated": updated,
+            "project_path": project_path,
+        }
+
+    # ---------- session summary ----------
+    def session_summary(
+        self,
+        description: str,
+        tags: Optional[List[str]] = None,
+        since_n: int = 20,
+    ) -> Dict[str, Any]:
+        """Create a summary entry that captures the most recent session work.
+
+        Reads the last *since_n* entries, collects all unique files/functions
+        touched, and creates a single "note" type entry that summarises the
+        session.  This is the recommended end-of-session command.
+
+        Args:
+            description: One-line summary of what the session accomplished.
+            tags:        Optional extra tags.
+            since_n:     How many recent entries to aggregate over.
+
+        Returns a dict with the created entry and any conflicts detected.
+        """
+        memory = self._read_memory()
+        recent = sorted(
+            memory,
+            key=lambda e: e.get("timestamp", ""),
+            reverse=True,
+        )[:since_n]
+
+        # Aggregate files & functions touched in the session
+        agg_files: list[str] = []
+        agg_functions: list[str] = []
+        for e in recent:
+            for f in e.get("files", []):
+                if f not in agg_files:
+                    agg_files.append(f)
+            for fn in e.get("functions", []):
+                if fn not in agg_functions:
+                    agg_functions.append(fn)
+
+        # Build an auto-cause from descriptions of recent entries
+        causes = [e.get("description", "")[:80] for e in recent[:5] if e.get("description")]
+        auto_cause = "; ".join(causes) if causes else "end-of-session aggregation"
+
+        payload: Dict[str, Any] = {
+            "type": "note",
+            "description": description,
+            "cause": auto_cause,
+            "fix": f"Session covered {len(recent)} entr(ies) and {len(agg_files)} file(s).",
+            "files": agg_files[:30],
+            "functions": agg_functions[:30],
+            "decisions": [],
+            "confidence": 0.9,
+            "tags": (tags or []) + ["session-summary"],
+        }
+        result = self.add_memory(payload)
+        self._log(
+            "session_summary",
+            [result["entry"]["id"]],
+            f"aggregated {len(recent)} recent entries over {len(agg_files)} files",
+        )
+        return result
