@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Memory System</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+</head>
+<body>
+  <!-- ── Header ── -->
+  <header class="app-header">
+    <div class="brand">🧠 AI Memory System</div>
+    <div class="header-controls">
+      <label class="header-label" for="projectSelect">Project</label>
+      <select id="projectSelect" class="select-box"></select>
+      <button class="btn btn-ghost" id="refreshBtn" title="Refresh data">↻</button>
+    </div>
+  </header>
+
+  <!-- ── Tab Navigation ── -->
+  <nav class="tab-nav" id="tabNav">
+    <button class="tab-btn active" data-tab="dashboard">📊 Dashboard</button>
+    <button class="tab-btn" data-tab="entries">📝 Entries</button>
+    <button class="tab-btn" data-tab="conflicts">
+      ⚠️ Conflicts
+      <span class="badge" id="conflictBadge" style="display:none"></span>
+    </button>
+    <button class="tab-btn" data-tab="graph">🔗 Graph</button>
+    <button class="tab-btn" data-tab="files">📂 Files</button>
+    <button class="tab-btn" data-tab="settings">⚙️ Settings</button>
+  </nav>
+
+  <!-- ── Main Content ── -->
+  <main class="app-main">
+
+    <!-- Tab: Dashboard -->
+    <div class="tab-pane active" id="tab-dashboard">
+      <div id="conflictBanner" class="banner banner-warn" style="display:none">
+        <strong>⚠️ Open Conflicts:</strong>
+        <span id="bannerConflictCount"></span> unresolved —
+        <a href="#" data-goto="conflicts">resolve now</a>
+      </div>
+      <div class="kpi-grid" id="kpiGrid">
+        <div class="kpi-card" id="kpi-total">
+          <div class="kpi-value">—</div><div class="kpi-label">Total Entries</div>
+        </div>
+        <div class="kpi-card" id="kpi-bugs">
+          <div class="kpi-value">—</div><div class="kpi-label">Bug Fixes</div>
+        </div>
+        <div class="kpi-card" id="kpi-features">
+          <div class="kpi-value">—</div><div class="kpi-label">Features</div>
+        </div>
+        <div class="kpi-card" id="kpi-decisions">
+          <div class="kpi-value">—</div><div class="kpi-label">Decisions</div>
+        </div>
+        <div class="kpi-card" id="kpi-confidence">
+          <div class="kpi-value">—</div><div class="kpi-label">Avg Confidence</div>
+        </div>
+        <div class="kpi-card kpi-warn" id="kpi-conflicts">
+          <div class="kpi-value">—</div><div class="kpi-label">Open Conflicts</div>
+        </div>
+        <div class="kpi-card" id="kpi-linked">
+          <div class="kpi-value">—</div><div class="kpi-label">Linked Entries</div>
+        </div>
+        <div class="kpi-card" id="kpi-active">
+          <div class="kpi-value">—</div><div class="kpi-label">Active Entries</div>
+        </div>
+      </div>
+      <div class="charts-grid">
+        <div class="chart-card">
+          <h3 class="chart-title">Entry Types</h3>
+          <div class="chart-wrap"><canvas id="chartTypes"></canvas></div>
+        </div>
+        <div class="chart-card">
+          <h3 class="chart-title">Activity (last 30 days)</h3>
+          <div class="chart-wrap"><canvas id="chartTimeline"></canvas></div>
+        </div>
+        <div class="chart-card">
+          <h3 class="chart-title">Top 10 Files</h3>
+          <div class="chart-wrap"><canvas id="chartFiles"></canvas></div>
+        </div>
+        <div class="chart-card">
+          <h3 class="chart-title">Confidence Distribution</h3>
+          <div class="chart-wrap"><canvas id="chartConfidence"></canvas></div>
+        </div>
+        <div class="chart-card chart-card-wide">
+          <h3 class="chart-title">Top Tags</h3>
+          <div class="chart-wrap"><canvas id="chartTags"></canvas></div>
+        </div>
+        <div class="chart-card">
+          <h3 class="chart-title">Status Breakdown</h3>
+          <div class="chart-wrap"><canvas id="chartStatus"></canvas></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Tab: Entries -->
+    <div class="tab-pane hidden" id="tab-entries">
+      <div class="toolbar">
+        <input type="text" id="entrySearch" class="search-box" placeholder="🔍 Search entries…">
+        <select id="filterType" class="select-box">
+          <option value="">All types</option>
+          <option value="bug_fix">Bug Fix</option>
+          <option value="feature">Feature</option>
+          <option value="decision">Decision</option>
+          <option value="note">Note</option>
+        </select>
+        <select id="filterStatus" class="select-box">
+          <option value="">All statuses</option>
+          <option value="active">Active</option>
+          <option value="resolved">Resolved</option>
+          <option value="superseded">Superseded</option>
+          <option value="conflict">Conflict</option>
+        </select>
+        <input type="text" id="filterFile" class="search-box" placeholder="File filter…">
+        <input type="text" id="filterTag" class="search-box" placeholder="Tag filter…">
+        <button class="btn btn-primary" id="applyFilters">Apply</button>
+        <button class="btn btn-ghost" id="clearFilters">Clear</button>
+      </div>
+      <div class="entries-layout">
+        <div class="entries-list-wrap">
+          <table class="data-table" id="entriesTable">
+            <thead>
+              <tr>
+                <th>Type</th><th>Status</th><th>Confidence</th>
+                <th>Description</th><th>Files</th><th>Date</th>
+              </tr>
+            </thead>
+            <tbody id="entriesBody"></tbody>
+          </table>
+          <div class="pagination" id="entriesPagination"></div>
+        </div>
+        <aside class="detail-panel hidden" id="entryDetail">
+          <button class="btn btn-ghost detail-close" id="detailClose">✕</button>
+          <div id="detailContent"></div>
+        </aside>
+      </div>
+    </div>
+
+    <!-- Tab: Conflicts -->
+    <div class="tab-pane hidden" id="tab-conflicts">
+      <div class="toolbar">
+        <span class="toolbar-info" id="conflictsInfo">Loading…</span>
+        <button class="btn btn-ghost" id="reloadConflicts">↻ Refresh</button>
+      </div>
+      <div id="conflictsGrid"></div>
+    </div>
+
+    <!-- Tab: Graph -->
+    <div class="tab-pane hidden" id="tab-graph">
+      <div class="graph-toolbar">
+        <span class="toolbar-label">Filter type:</span>
+        <label><input type="checkbox" class="graph-type-filter" value="decision" checked> Decision</label>
+        <label><input type="checkbox" class="graph-type-filter" value="bug_fix" checked> Bug Fix</label>
+        <label><input type="checkbox" class="graph-type-filter" value="feature" checked> Feature</label>
+        <label><input type="checkbox" class="graph-type-filter" value="note" checked> Note</label>
+        <span class="toolbar-label">Status:</span>
+        <label><input type="checkbox" id="hideSuperseded" checked> Hide superseded</label>
+        <label class="graph-conf-label">Min conf:
+          <input type="range" id="graphMinConf" min="0" max="1" step="0.1" value="0">
+          <span id="graphMinConfVal">0.0</span>
+        </label>
+        <button class="btn btn-ghost" id="graphPhysicsToggle">⏸ Pause physics</button>
+        <button class="btn btn-ghost" id="graphFit">⊡ Fit</button>
+        <button class="btn btn-ghost" id="graphReload">↻ Reload</button>
+      </div>
+      <div class="graph-layout">
+        <div id="graphContainer" class="graph-canvas"></div>
+        <aside class="graph-detail hidden" id="graphDetail">
+          <button class="btn btn-ghost" id="graphDetailClose">✕</button>
+          <div id="graphDetailContent"></div>
+        </aside>
+      </div>
+      <div class="graph-legend">
+        <span class="legend-dot" style="background:#58a6ff"></span> Decision
+        <span class="legend-dot" style="background:#f85149"></span> Bug Fix
+        <span class="legend-dot" style="background:#3fb950"></span> Feature
+        <span class="legend-dot" style="background:#8b949e"></span> Note
+      </div>
+    </div>
+
+    <!-- Tab: Files -->
+    <div class="tab-pane hidden" id="tab-files">
+      <div class="toolbar">
+        <input type="text" id="fileSearch" class="search-box" placeholder="🔍 Filter files…">
+        <select id="fileSortBy" class="select-box">
+          <option value="count">Sort by entry count</option>
+          <option value="name">Sort by name</option>
+        </select>
+      </div>
+      <div class="files-layout">
+        <div class="file-list" id="fileList"></div>
+        <aside class="file-detail hidden" id="fileDetail">
+          <button class="btn btn-ghost" id="fileDetailClose">✕</button>
+          <div id="fileDetailContent"></div>
+        </aside>
+      </div>
+    </div>
+
+    <!-- Tab: Settings -->
+    <div class="tab-pane hidden" id="tab-settings">
+      <div class="settings-layout">
+        <form id="settingsForm" class="settings-form">
+
+          <section class="settings-section">
+            <h3>🕒 Confidence Decay</h3>
+            <label class="toggle-row">
+              <span>Enable decay</span>
+              <input type="checkbox" id="decayEnabled" name="decayEnabled">
+            </label>
+            <label class="field-row">
+              <span>Half-life (days)</span>
+              <input type="number" id="decayHalfLife" min="1" max="365" step="1" value="60">
+            </label>
+            <label class="field-row">
+              <span>Minimum confidence floor</span>
+              <input type="number" id="decayMinConf" min="0" max="1" step="0.05" value="0.40">
+            </label>
+          </section>
+
+          <section class="settings-section">
+            <h3>🔁 Semantic Deduplication</h3>
+            <label class="toggle-row">
+              <span>Enable deduplication</span>
+              <input type="checkbox" id="dedupEnabled" name="dedupEnabled">
+            </label>
+            <label class="field-row">
+              <span>Similarity threshold</span>
+              <input type="number" id="dedupThreshold" min="0.5" max="1" step="0.01" value="0.88">
+            </label>
+          </section>
+
+          <section class="settings-section">
+            <h3>↩️ Revert Detection</h3>
+            <label class="toggle-row">
+              <span>Enable revert detection</span>
+              <input type="checkbox" id="revertEnabled" name="revertEnabled">
+            </label>
+            <label class="field-row">
+              <span>Revert pair threshold</span>
+              <input type="number" id="revertThreshold" min="1" max="10" step="1" value="2">
+            </label>
+          </section>
+
+          <section class="settings-section">
+            <h3>🔍 Stale Entry Check</h3>
+            <label class="field-row">
+              <span>Minimum entry age (days)</span>
+              <input type="number" id="staleMinAge" min="1" max="365" step="1" value="7">
+            </label>
+          </section>
+
+          <section class="settings-section">
+            <h3>📖 Wiki</h3>
+            <label class="toggle-row">
+              <span>Auto-render wiki on add_memory</span>
+              <input type="checkbox" id="wikiAutoRender" name="wikiAutoRender">
+            </label>
+          </section>
+
+          <section class="settings-section">
+            <h3>🔎 Query</h3>
+            <label class="field-row">
+              <span>Default top-k results</span>
+              <input type="number" id="queryTopK" min="1" max="50" step="1" value="10">
+            </label>
+            <label class="field-row">
+              <span>Decay blend weight (0–1)</span>
+              <input type="number" id="queryDecayBlend" min="0" max="1" step="0.05" value="0.10">
+            </label>
+          </section>
+
+          <section class="settings-section">
+            <h3>🏷️ Default Tags</h3>
+            <div class="tag-editor" id="defaultTagsEditor">
+              <div class="tag-list" id="defaultTagsList"></div>
+              <div class="tag-add-row">
+                <input type="text" id="tagInput" class="search-box" placeholder="New tag…">
+                <button type="button" class="btn btn-ghost" id="addTagBtn">+ Add</button>
+              </div>
+            </div>
+          </section>
+
+          <div class="settings-actions">
+            <button type="submit" class="btn btn-primary">💾 Save Settings</button>
+            <button type="button" class="btn btn-ghost" id="resetSettings">Reset to defaults</button>
+          </div>
+        </form>
+
+        <!-- Operations panel -->
+        <div class="ops-panel">
+          <h3>⚡ Operations</h3>
+
+          <div class="op-card">
+            <h4>Confidence Decay</h4>
+            <p>Apply time-based decay to stale entries.</p>
+            <div class="op-controls">
+              <label><input type="checkbox" id="opDecayDryRun" checked> Dry run</label>
+            </div>
+            <button class="btn btn-secondary" data-op="decay">Run Decay</button>
+          </div>
+
+          <div class="op-card">
+            <h4>Deduplication</h4>
+            <p>Find and merge near-duplicate entries.</p>
+            <div class="op-controls">
+              <label><input type="checkbox" id="opDedupDryRun" checked> Dry run</label>
+            </div>
+            <button class="btn btn-secondary" data-op="deduplicate">Run Deduplication</button>
+          </div>
+
+          <div class="op-card">
+            <h4>Render Wiki</h4>
+            <p>Regenerate all markdown wiki pages.</p>
+            <button class="btn btn-secondary" data-op="render_wiki">Render Wiki</button>
+          </div>
+
+          <div class="op-card">
+            <h4>Lint Check</h4>
+            <p>Run health checks on the memory store.</p>
+            <button class="btn btn-secondary" data-op="lint">Run Lint</button>
+          </div>
+
+          <div class="op-result hidden" id="opResult">
+            <h4>Result</h4>
+            <pre id="opResultPre"></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- ── Toast notifications ── -->
+  <div class="toast-container" id="toastContainer"></div>
+
+  <!-- ── Confirm Dialog ── -->
+  <div class="dialog-overlay hidden" id="dialogOverlay">
+    <div class="dialog">
+      <h3 id="dialogTitle">Confirm</h3>
+      <p id="dialogMessage"></p>
+      <textarea id="dialogReason" class="dialog-reason" placeholder="Reason (optional)…" rows="2"></textarea>
+      <div class="dialog-actions">
+        <button class="btn btn-primary" id="dialogConfirm">Confirm</button>
+        <button class="btn btn-ghost" id="dialogCancel">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

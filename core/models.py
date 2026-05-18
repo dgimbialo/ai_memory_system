@@ -35,6 +35,14 @@ class MemoryEntry:
     timestamp: str = field(default_factory=_utcnow)
     conflicts_with: List[str] = field(default_factory=list)
     tags: List[str] = field(default_factory=list)
+    # Dependency graph
+    # depends_on: IDs of entries this entry builds upon (e.g. a bug_fix depends on a decision)
+    depends_on: List[str] = field(default_factory=list)
+    # required_by: IDs of entries that depend on this one (auto-populated on link creation)
+    required_by: List[str] = field(default_factory=list)
+    # Test-ID traceability
+    # test_ids: names of tests that verify this entry's behaviour
+    test_ids: List[str] = field(default_factory=list)
 
     def validate(self) -> None:
         if self.type not in VALID_TYPES:
@@ -51,6 +59,12 @@ class MemoryEntry:
             raise ValueError("functions must be a list")
         if not isinstance(self.decisions, list):
             raise ValueError("decisions must be a list")
+        if not isinstance(self.depends_on, list):
+            raise ValueError("depends_on must be a list")
+        if not isinstance(self.required_by, list):
+            raise ValueError("required_by must be a list")
+        if not isinstance(self.test_ids, list):
+            raise ValueError("test_ids must be a list")
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -59,9 +73,12 @@ class MemoryEntry:
     def from_dict(cls, data: Dict[str, Any]) -> "MemoryEntry":
         allowed = {f for f in cls.__dataclass_fields__}
         clean = {k: v for k, v in data.items() if k in allowed}
-        # Back-compat: entries saved before functions/decisions fields existed
+        # Back-compat: entries saved before functions/decisions/graph fields existed
         clean.setdefault("functions", [])
         clean.setdefault("decisions", [])
+        clean.setdefault("depends_on", [])
+        clean.setdefault("required_by", [])
+        clean.setdefault("test_ids", [])
         return cls(**clean)
 
 

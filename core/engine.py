@@ -17,6 +17,7 @@ MEMORY_FILE = "memory.json"
 WIKI_FILE = "wiki.json"
 CONFLICTS_FILE = "conflicts.json"
 LOG_FILE = "activity_log.json"
+FILE_SUMMARIES_FILE = "file_summaries.json"
 
 
 def _now() -> str:
@@ -63,6 +64,16 @@ class MemoryEngine:
     # ---------- public API ----------
     def add_memory(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Validate, append, run conflict detection, refresh wiki."""
+        # Extract depends_on before building MemoryEntry so we can process
+        # them via DependencyGraph.add_link (which also updates required_by).
+        raw_depends_on: List[str] = list(
+            payload.get("depends_on", []) if isinstance(payload, dict) else []
+        )
+        # Strip depends_on from payload so MemoryEntry is saved without pre-set
+        # links; add_link below will set both sides atomically.
+        if raw_depends_on and isinstance(payload, dict):
+            payload = {k: v for k, v in payload.items() if k != "depends_on"}
+
         entry = MemoryEntry.from_dict(payload) if not isinstance(payload, MemoryEntry) else payload
         entry.validate()
 
@@ -91,10 +102,107 @@ class MemoryEngine:
             reason=f"new {entry.type}; {len(conflicts)} conflict(s) detected",
         )
 
+        # Revert pattern detection 
+        revert_warning = None
+        from .revert_detector import RevertDetector
+        revert_warning_obj = RevertDetector(self).check(
+            entry.to_dict(),
+            self._read_memory(),  # re-read: includes the just-saved entry
+        )
+        if revert_warning_obj is not None:
+            revert_warning = revert_warning_obj.to_dict()
+
+        # Dependency link creation
+        # If caller passed depends_on IDs, create links (updates required_by on targets)
+        created_links: List[str] = []
+        if raw_depends_on:
+            from .dependency_graph import DependencyGraph
+            _dg = DependencyGraph(self)
+            for target_id in raw_depends_on:
+                try:
+                    _dg.add_link(entry.id, target_id)
+                    created_links.append(target_id)
+                except (KeyError, ValueError):
+                    pass  # silently skip invalid/duplicate/cycle links
+
+        # Dependency link suggestions
+        # Only for bug_fix / feature — decisions suggest themselves
+        suggested_links: List[Dict[str, Any]] = []
+        if entry.type in ("bug_fix", "feature"):
+            from .dependency_graph import DependencyGraph
+            try:
+                suggested_links = DependencyGraph(self).suggest_links(
+                    entry.id, threshold=0.75, top_k=3
+                )
+            except Exception:
+                pass  # suggestions are best-effort, never block add_memory
+
+        # File summary update
+        if entry.files:
+            self._update_file_summaries(entry.files)
+
         return {
-            "entry": entry.to_dict(),
-            "conflicts": [c.to_dict() for c in conflicts],
+            "entry":           entry.to_dict(),
+            "conflicts":       [c.to_dict() for c in conflicts],
+            "revert_warning":  revert_warning,
+            "created_links":   created_links,
+            "suggested_links": suggested_links,
         }
+
+    # ---------- file summaries ----------
+
+    def _update_file_summaries(self, files: List[str]) -> None:
+        """Regenerate summaries for the given file paths and persist to disk."""
+        from .summarizer import FileSummarizer
+        memory = self._read_memory()
+        summaries: Dict[str, str] = self.storage.read(FILE_SUMMARIES_FILE, default={})
+        if not isinstance(summaries, dict):
+            summaries = {}
+        summarizer = FileSummarizer()
+        for file_path in files:
+            entries_for_file = [
+                e for e in memory
+                if file_path in (e.get("files") or [])
+            ]
+            summaries[file_path] = summarizer.summarize(file_path, entries_for_file)
+        self.storage.write(FILE_SUMMARIES_FILE, summaries)
+
+    def summarize_file(self, file_path: str) -> Dict[str, Any]:
+        """Return (and regenerate) the summary for a specific file.
+
+        Parameters
+        ----------
+        file_path : str
+            Exact file path as stored in memory entries (e.g. 'src/main.cpp').
+
+        Returns
+        -------
+        dict with keys: file_path, summary, entry_count
+        """
+        from .summarizer import FileSummarizer
+        memory = self._read_memory()
+        entries_for_file = [
+            e for e in memory
+            if file_path in (e.get("files") or [])
+        ]
+        summarizer = FileSummarizer()
+        summary = summarizer.summarize(file_path, entries_for_file)
+        # Persist updated summary
+        summaries: Dict[str, str] = self.storage.read(FILE_SUMMARIES_FILE, default={})
+        if not isinstance(summaries, dict):
+            summaries = {}
+        summaries[file_path] = summary
+        self.storage.write(FILE_SUMMARIES_FILE, summaries)
+        return {
+            "file_path":   file_path,
+            "summary":     summary,
+            "entry_count": len(entries_for_file),
+        }
+
+    def _get_file_summaries(self) -> Dict[str, str]:
+        """Read current file_summaries.json (read-only helper)."""
+        data = self.storage.read(FILE_SUMMARIES_FILE, default={})
+        return data if isinstance(data, dict) else {}
 
     def list_memory(
         self,
@@ -172,6 +280,10 @@ class MemoryEngine:
             ]
 
         scored: List[tuple[float, Dict[str, Any]]] = []
+        from .decay import effective_confidence as _eff_conf
+        from datetime import datetime, timezone as _tz
+        _now = datetime.now(_tz.utc)
+
         for e in memory:
             # Index over description + cause + fix + decisions for richer matching
             decisions_text = " ".join(e.get("decisions", []))
@@ -181,39 +293,93 @@ class MemoryEngine:
                 e.get("fix", ""),
                 decisions_text,
             ]))
-            score = similarity(query, text)
+            sem_score = similarity(query, text)
+            # Blend semantic score with decayed confidence so stale entries rank lower.
+            # Weight: 90% semantic + 10% decayed confidence — keeps relevance dominant.
+            conf_factor = _eff_conf(
+                original=float(e.get("confidence") or 0.5),
+                timestamp=e.get("timestamp") or "",
+                now=_now,
+            )
+            score = sem_score * 0.9 + conf_factor * 0.1
             scored.append((score, e))
 
         scored.sort(key=lambda x: x[0], reverse=True)
         top = scored[:top_k]
 
+        file_summaries = self._get_file_summaries()
+
         if fmt == "concise":
-            return [
-                {
-                    "score":       round(float(s), 4),
-                    "id":          e["id"],
-                    "type":        e.get("type", ""),
-                    "status":      e.get("status", ""),
-                    "description": e.get("description", ""),
-                    "decisions":   e.get("decisions", []),
-                    "fix_summary": (e.get("fix") or "")[:200],
-                    "files":       e.get("files", []),
-                    "functions":   e.get("functions", []),
-                    "tags":        [t for t in e.get("tags", [])
-                                    if not t.startswith("project:")],
+            results = []
+            for s, e in top:
+                # Collect unique file summaries referenced by this entry
+                entry_files = e.get("files", [])
+                entry_file_summaries = {
+                    f: file_summaries[f]
+                    for f in entry_files
+                    if f in file_summaries
                 }
-                for s, e in top
-            ]
+                results.append({
+                    "score":          round(float(s), 4),
+                    "id":             e["id"],
+                    "type":           e.get("type", ""),
+                    "status":         e.get("status", ""),
+                    "description":    e.get("description", ""),
+                    "decisions":      e.get("decisions", []),
+                    "fix_summary":    (e.get("fix") or "")[:200],
+                    "files":          entry_files,
+                    "file_summaries": entry_file_summaries,
+                    "functions":      e.get("functions", []),
+                    "tags":           [t for t in e.get("tags", [])
+                                       if not t.startswith("project:")],
+                    "depends_on":     e.get("depends_on", []),
+                    "required_by":    e.get("required_by", []),
+                })
+            return results
 
         # fmt == 'full'
         return [{"score": round(float(s), 4), "entry": e} for s, e in top]
+
+    # ---------- conflict resolution ----------
+
+    def list_conflicts(self) -> List[Dict[str, Any]]:
+        """Return all unresolved conflicts enriched with full entry details."""
+        from .conflict_resolver import ConflictResolver
+        return ConflictResolver(self).list_unresolved()
+
+    def resolve_conflict(
+        self,
+        conflict_id: str,
+        action: str,
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        """Resolve a conflict record.
+
+        action: 'supersede_a' | 'supersede_b' | 'merge' | 'dismiss'
+        """
+        from .conflict_resolver import ConflictResolver
+        return ConflictResolver(self).resolve(conflict_id, action, reason)
+
+    # ---------- status / confidence ----------
 
     def update_status(self, entry_id: str, status: str, reason: str = "") -> Dict[str, Any]:
         memory = self._read_memory()
         updated = self.updater.update_status(memory, entry_id, status)
         self.storage.write(MEMORY_FILE, memory)
         self._log("update_status", [entry_id], reason or f"status -> {status}")
-        return updated
+        # Test-ID warning: alert if the entry has linked tests and is being superseded
+        test_warning = None
+        entry_data = next((e for e in memory if e.get("id") == entry_id), {})
+        test_ids = entry_data.get("test_ids") or []
+        if test_ids and status == "superseded":
+            test_warning = (
+                f"Entry has {len(test_ids)} linked test(s). "
+                f"Please verify: {test_ids}"
+            )
+        result = dict(updated)
+        if test_warning:
+            result["test_warning"] = test_warning
+        return result
 
     def update_confidence(
         self, entry_id: str, confidence: float, reason: str = ""
@@ -224,6 +390,109 @@ class MemoryEngine:
         self._log("update_confidence", [entry_id], reason or f"confidence -> {confidence}")
         return updated
 
+    # ---------- dependency graph ----------
+
+    def add_dependency_link(self, from_id: str, to_id: str) -> Dict[str, Any]:
+        """Create a directed link: from_id depends_on to_id.
+
+        Updates both entries atomically:
+            from_entry.depends_on += [to_id]
+            to_entry.required_by  += [from_id]
+        Raises KeyError if either id not found.
+        Raises ValueError if link exists, would create a cycle, or is self-referential.
+        """
+        from .dependency_graph import DependencyGraph
+        return DependencyGraph(self).add_link(from_id, to_id)
+
+    def remove_dependency_link(self, from_id: str, to_id: str) -> Dict[str, Any]:
+        """Remove a directed link: from_id no longer depends_on to_id."""
+        from .dependency_graph import DependencyGraph
+        return DependencyGraph(self).remove_link(from_id, to_id)
+
+    def get_dependencies(
+        self,
+        entry_id: str,
+        depth: int = 1,
+    ) -> Dict[str, Any]:
+        """Return dependency subgraph for entry_id.
+
+        depth=1   direct links only (default)
+        depth=-1  full transitive closure
+        depth=N   N levels deep
+        """
+        from .dependency_graph import DependencyGraph
+        return DependencyGraph(self).get_dependencies(entry_id, depth=depth)
+
+    def suggest_links(
+        self,
+        entry_id: str,
+        threshold: float = 0.75,
+        top_k: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Suggest potential depends_on links based on semantic similarity.
+
+        Returns ranked list of decision entries that are semantically
+        similar to entry_id. Results are suggestions only — never auto-committed.
+        """
+        from .dependency_graph import DependencyGraph
+        return DependencyGraph(self).suggest_links(entry_id, threshold, top_k)
+
+    # ---------- deduplication ----------
+
+    def find_duplicate_clusters(
+        self, threshold: float = 0.88
+    ) -> List[Dict[str, Any]]:
+        """Return clusters of near-duplicate entries (read-only preview).
+
+        Each cluster dict contains:
+            canonical_id, cluster_size, member_ids, descriptions, similarities
+        """
+        from .deduplicator import Deduplicator
+        return Deduplicator(self, threshold).find_clusters()
+
+    def deduplicate(
+        self,
+        dry_run: bool = False,
+        threshold: float = 0.88,
+    ) -> Dict[str, Any]:
+        """Find and merge all near-duplicate entry clusters.
+
+        Parameters
+        ----------
+        dry_run   : if True, compute clusters but do NOT write to disk.
+        threshold : cosine similarity threshold (default 0.88).
+
+        Returns a summary dict with cluster details.
+        """
+        from .deduplicator import Deduplicator
+        return Deduplicator(self, threshold).apply(dry_run=dry_run)
+
+    # ---------- confidence decay ----------
+
+    def decay(
+        self,
+        dry_run: bool = False,
+        half_life_days: float = 60.0,
+        min_confidence: float = 0.40,
+    ) -> Dict[str, Any]:
+        """Apply time-based confidence decay to all active entries.
+
+        Parameters
+        ----------
+        dry_run        : if True, compute changes but do NOT write to disk.
+        half_life_days : days until confidence halves (default 60).
+        min_confidence : absolute floor, never goes below this (default 0.40).
+
+        Returns a dict describing what changed (or would change).
+        """
+        from .decay import DecayEngine
+        return DecayEngine(self, half_life_days, min_confidence).apply(dry_run=dry_run)
+
+    def decay_preview(self) -> List[Dict[str, Any]]:
+        """Return all entries with effective_confidence field (read-only)."""
+        from .decay import DecayEngine
+        return DecayEngine(self).preview()
+
     def state(self) -> Dict[str, Any]:
         memory = self._read_memory()
         wiki = self.storage.read(WIKI_FILE, default={})
@@ -233,6 +502,101 @@ class MemoryEngine:
             "entry_count": len(memory),
             "conflict_count": len(conflicts),
             "wiki": wiki,
+        }
+
+    # ---------- stale entry detection ----------
+
+    def check_stale(
+        self,
+        repo_path: str,
+        min_age_days: int = 7,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """Detect memory entries whose referenced files/functions no longer exist.
+
+        For each active entry older than *min_age_days*:
+        1. Check if all ``entry.files`` still exist in the repo working tree.
+        2. Check if all ``entry.functions`` still appear in those files.
+        3. If anything is missing: tag the entry with ``"stale"`` (unless dry_run).
+
+        Parameters
+        ----------
+        repo_path    : str   Absolute path to the git repository root.
+        min_age_days : int   Only check entries older than this (default 7).
+        dry_run      : bool  If True, compute results but do NOT write to disk.
+
+        Returns
+        -------
+        dict with keys:
+            repo_path       : str
+            dry_run         : bool
+            checked         : int     — number of entries inspected
+            stale_count     : int     — entries flagged as stale
+            candidates      : list    — full detail per stale entry
+            is_git_repo     : bool    — whether git was available
+        """
+        from .git_inspector import GitInspector
+        from datetime import datetime, timezone, timedelta
+
+        inspector = GitInspector(repo_path)
+        memory = self._read_memory()
+        cutoff = datetime.now(timezone.utc) - timedelta(days=min_age_days)
+
+        candidates: List[Dict[str, Any]] = []
+        checked = 0
+
+        for entry in memory:
+            if entry.get("status") != "active":
+                continue
+            # Skip entries with no files and no functions (nothing to check)
+            if not entry.get("files") and not entry.get("functions"):
+                continue
+            # Age filter
+            ts_str = entry.get("timestamp", "")
+            try:
+                ts = datetime.fromisoformat(ts_str)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                ts = datetime.min.replace(tzinfo=timezone.utc)
+            if ts > cutoff:
+                continue  # too recent to check
+
+            checked += 1
+            result = inspector.check_entry(entry)
+            if result["is_stale"]:
+                candidates.append({
+                    "entry_id":      result["entry_id"],
+                    "description":   (entry.get("description") or "")[:120],
+                    "missing_files": result["missing_files"],
+                    "missing_fns":   result["missing_fns"],
+                    "reason":        result["reason"],
+                    "timestamp":     entry.get("timestamp", ""),
+                    "confidence":    entry.get("confidence", 0),
+                })
+
+        if not dry_run and candidates:
+            stale_ids = {c["entry_id"] for c in candidates}
+            for entry in memory:
+                if entry.get("id") in stale_ids:
+                    tags = list(entry.get("tags") or [])
+                    if "stale" not in tags:
+                        tags.append("stale")
+                    entry["tags"] = tags
+            self.storage.write(MEMORY_FILE, memory)
+            self._log(
+                "check_stale",
+                [c["entry_id"] for c in candidates],
+                f"tagged {len(candidates)} stale entry/entries (repo: {repo_path})",
+            )
+
+        return {
+            "repo_path":   repo_path,
+            "dry_run":     dry_run,
+            "checked":     checked,
+            "stale_count": len(candidates),
+            "candidates":  candidates,
+            "is_git_repo": inspector.is_git_repo(),
         }
 
     # ---------- markdown projection ----------
@@ -281,11 +645,21 @@ class MemoryEngine:
         memory = self._read_memory()
 
         # Collect decisions from qualifying entries
+        # Use decayed confidence so stale decisions don't pollute Learned Patterns
+        from .decay import effective_confidence as _eff_conf
+        from datetime import datetime, timezone as _tz
+        _now = datetime.now(_tz.utc)
+
         patterns: list[str] = []
         for e in memory:
             if e.get("status") not in ("active",):
                 continue
-            if float(e.get("confidence", 0)) < min_confidence:
+            eff_conf = _eff_conf(
+                original=float(e.get("confidence") or 0.0),
+                timestamp=e.get("timestamp") or "",
+                now=_now,
+            )
+            if eff_conf < min_confidence:
                 continue
             decisions = e.get("decisions") or []
             for d in decisions:

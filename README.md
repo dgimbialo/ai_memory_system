@@ -2,7 +2,7 @@
 
 A self-contained, **local** persistent memory engine for software projects, built for VS Code + GitHub Copilot Agent workflows.
 
-It **remembers decisions, tracks bugs and features, detects contradictions** between historical entries, renders a structured Markdown wiki, and — crucially — automatically feeds that knowledge back into every Copilot Agent session via VS Code hooks so the agent always has full project context without any manual `#file` references.
+It **remembers decisions, tracks bugs and features, detects contradictions** between historical entries, renders a structured Markdown wiki, visualises dependency graphs, and automatically feeds that knowledge back into every Copilot Agent session via VS Code hooks so the agent always has full project context without any manual `#file` references.
 
 ---
 
@@ -35,11 +35,16 @@ One installation at `C:\ai_memory_system` serves **all** your projects — each 
 - **PostToolUse hook** — deterministically records a memory entry after every file write
 - **Append-first storage** — historical entries are never silently overwritten
 - **Atomic JSON writes** with automatic backup before overwrite
-- **Conflict detection** via semantic similarity + heuristics:
-  - contradictory fixes on shared files
-  - semantically opposite solutions (`enable` vs `disable`)
-  - unresolved duplicate issues
+- **Conflict detection + resolution** — semantic similarity + heuristics; `supersede`, `merge`, `dismiss` actions with full audit trail
+- **Revert detection** — identifies repeated revert patterns across entries
+- **Confidence decay** — time-based decay with preview mode
+- **Semantic deduplication** — near-duplicate detection and merge with threshold control
+- **Dependency graph** — `depends_on` / `required_by` links; cycle detection; semantic link suggestions
+- **Auto file summaries** — per-file digest regenerated on every `add_memory`
+- **Test-ID links** — attach test identifiers to entries; warns when superseded entries have linked tests
+- **Git stale check** — cross-checks entries against git history to flag outdated knowledge
 - **Markdown wiki** auto-rendered with Obsidian-friendly `[[wikilinks]]`: by type, file, status
+- **HTML dashboard** — local web UI with charts, vis.js dependency graph, settings form, operations panel
 - **Activity log** — every change timestamped with action and reason
 - **Learner** — analyses Copilot chat logs, extracts patterns, updates all managed project instructions
 - **Daemon** — background file watcher for non-agent edits (fallback)
@@ -80,7 +85,7 @@ python bootstrap.py
 ## Quickstart — Memory CLI (`run.py`)
 
 ```powershell
-# Add a memory entry for a specific project
+# Add a memory entry with dependency and test links
 python run.py --project my_app add_memory `
   --type bug_fix `
   --description "Login crashes on empty password" `
@@ -88,25 +93,28 @@ python run.py --project my_app add_memory `
   --fix "Added validation in auth.py line 42" `
   --files src/auth.py `
   --confidence 0.9 `
-  --tags backend auth
-
-# List entries for a project
-python run.py --project my_app list_memory
+  --tags backend auth `
+  --depends-on <prior_decision_id> `
+  --test-ids test_login_empty_password
 
 # Semantic search
 python run.py --project my_app query_memory "authentication bug"
 
-# Detect conflicts
-python run.py --project my_app detect_conflicts
+# Resolve a conflict
+python run.py --project my_app resolve_conflict `
+  --id <conflict_id> --action supersede_a --reason "B is correct"
 
-# Render Markdown wiki  →  data/projects/my_app/wiki/
+# Dependency graph
+python run.py --project my_app add_link --from-id <id1> --to-id <id2>
+python run.py --project my_app get_dependencies --id <id> --depth 2
+python run.py --project my_app suggest_links --id <id> --threshold 0.75
+
+# Maintenance
+python run.py --project my_app decay --dry-run
+python run.py --project my_app deduplicate --dry-run
+python run.py --project my_app check_stale --repo-path C:\Projects\MyApp
 python run.py --project my_app render_wiki
-
-# Health check
 python run.py --project my_app lint
-
-# Engine summary
-python run.py --project my_app state
 ```
 
 > Omit `--project` to use the default shared store (`data/`).
@@ -115,15 +123,50 @@ python run.py --project my_app state
 
 | Command | Description |
 |---|---|
-| `add_memory` | Add a structured memory entry |
+| `add_memory` | Add entry (`--type`, `--description`, `--cause`, `--fix`, `--files`, `--confidence`, `--tags`, `--depends-on`, `--test-ids`) |
 | `list_memory` | List entries (filter: `--type`, `--status`) |
-| `detect_conflicts` | Full conflict re-scan |
 | `query_memory` | Top-k semantic search |
-| `state` | Entry count, conflicts, wiki, embedding backend |
 | `update_status` | Change entry status (logged) |
 | `update_confidence` | Change entry confidence (logged) |
+| `detect_conflicts` | Full conflict re-scan |
+| `resolve_conflict` | Resolve conflict: `--id`, `--action supersede_a\|supersede_b\|merge\|dismiss`, `--reason` |
+| `decay` | Apply time-based confidence decay (`--half-life-days`, `--min-confidence`, `--dry-run` / `--apply`) |
+| `deduplicate` | Find and merge near-duplicates (`--threshold`, `--dry-run` / `--apply`) |
+| `add_link` | Create a `depends_on` link (`--from-id`, `--to-id`) |
+| `remove_link` | Remove a dependency link |
+| `get_dependencies` | Show transitive dependencies (`--id`, `--depth`) |
+| `suggest_links` | Suggest links by semantic similarity (`--id`, `--threshold`, `--top-k`) |
+| `summarize_file` | Print auto-generated file summary |
+| `check_stale` | Cross-check against git history (`--repo-path`, `--min-age-days`, `--dry-run` / `--apply`) |
 | `render_wiki` | Render Markdown wiki under `data/…/wiki/` |
 | `lint` | 7 health checks: stale, low-confidence, orphans, duplicates… |
+| `state` | Entry count, conflicts, wiki, embedding backend |
+
+---
+
+## HTML Dashboard — `server.py`
+
+A lightweight single-page web UI served entirely on localhost — no npm, no build step.
+
+```powershell
+python server.py --project piobmasterpro
+# opens http://localhost:5001 automatically
+
+python server.py --project my_app --port 8080 --no-browser
+```
+
+### Tabs
+
+| Tab | Contents |
+|---|---|
+| **Dashboard** | KPI cards, 6 Chart.js charts (types, activity timeline, top files, confidence histogram, top tags, status breakdown) |
+| **Entries** | Filterable/searchable table with expandable detail panel, inline status & confidence editing, tag management |
+| **Conflicts** | Side-by-side conflict cards with action buttons and reason dialog |
+| **Graph** | vis.js dependency graph — node colour by type, size by confidence, filter controls, suggest-links |
+| **Files** | File list with entry-count badges; click → auto-summary + entries |
+| **Settings** | Full settings form + Operations panel (decay, deduplication, render wiki, lint) |
+
+All tabs call the REST API at `/api/*` — every endpoint accepts `?project=NAME`.
 
 ---
 
@@ -201,40 +244,65 @@ python run_infra.py daemon --projects C:\Projects\MyApp C:\Projects\OtherApp
 ```
 ai_memory_system/
 ├── core/
-│   ├── engine.py            # single gateway — all memory operations
-│   ├── storage.py           # atomic JSON I/O + backups
-│   ├── models.py            # MemoryEntry, ConflictRecord
-│   ├── conflict.py          # conflict detection rules
-│   ├── embeddings.py        # sentence-transformers + fallback
-│   ├── updater.py           # controlled merge & wiki rebuild
-│   ├── wiki_md.py           # Markdown wiki renderer (Obsidian wikilinks)
-│   ├── lint.py              # 7 health checks
-│   ├── vscode_infra.py      # scaffolds .github/ in any project
-│   ├── copilot_logger.py    # reads VS Code Copilot debug logs
-│   ├── learner.py           # extracts patterns, updates instructions
-│   ├── auto_memory.py       # correlates file changes + Copilot events
-│   ├── watcher.py           # file watcher daemon (watchdog / polling)
-│   ├── hook_handler.py      # PostToolUse hook — auto memory recording
-│   └── context_injector.py  # SessionStart hook — memory context injection
-├── data/                    # ← gitignored; created by bootstrap.py
+│   ├── engine.py             # single gateway — all memory operations
+│   ├── storage.py            # atomic JSON I/O + backups
+│   ├── models.py             # MemoryEntry, ConflictRecord (depends_on, test_ids fields)
+│   ├── conflict.py           # conflict detection rules
+│   ├── conflict_resolver.py  # supersede / merge / dismiss actions
+│   ├── revert_detector.py    # revert pattern detection
+│   ├── decay.py              # time-based confidence decay
+│   ├── deduplicator.py       # near-duplicate detection and merge
+│   ├── dependency_graph.py   # depends_on graph — add/remove/query/suggest
+│   ├── summarizer.py         # per-file auto summary generation
+│   ├── git_inspector.py      # git stale check via subprocess
+│   ├── embeddings.py         # sentence-transformers + deterministic fallback
+│   ├── updater.py            # controlled merge & wiki rebuild
+│   ├── wiki_md.py            # Markdown wiki renderer (Obsidian wikilinks)
+│   ├── lint.py               # 7 health checks
+│   ├── vscode_infra.py       # scaffolds .github/ in any project
+│   ├── copilot_logger.py     # reads VS Code Copilot debug logs
+│   ├── learner.py            # extracts patterns, updates instructions
+│   ├── auto_memory.py        # correlates file changes + Copilot events
+│   ├── watcher.py            # file watcher daemon (watchdog / polling)
+│   ├── hook_handler.py       # PostToolUse hook — auto memory recording
+│   └── context_injector.py   # SessionStart hook — memory context injection
+├── ui/                       # HTML dashboard (served by server.py)
+│   ├── index.html
+│   ├── style.css
+│   ├── app.js                # state, API wrapper, tab routing, toasts
+│   ├── dashboard.js          # KPI cards + Chart.js charts
+│   ├── entries.js            # filterable entry table + detail panel
+│   ├── conflicts.js          # conflict cards + resolution actions
+│   ├── graph.js              # vis.js dependency graph
+│   ├── filebrowser.js        # file list + auto-summary view
+│   └── settings.js           # settings form + operations panel
+├── data/                     # ← gitignored; created by bootstrap.py
 │   ├── .gitkeep
-│   └── projects/            # per-project isolated stores
+│   └── projects/             # per-project isolated stores
 │       └── <name>/
 │           ├── memory.json
 │           ├── conflicts.json
+│           ├── activity_log.json
+│           ├── file_summaries.json
+│           ├── settings.json
 │           └── wiki/
 ├── templates/
 │   └── copilot_instructions.md.tpl
 ├── .github/
 │   ├── copilot-instructions.md
 │   ├── hooks/
-│   │   └── memory.json      # SessionStart + PostToolUse hooks
+│   │   └── memory.json       # SessionStart + PostToolUse hooks
 │   └── prompts/
 │       └── record-memory.prompt.md
-├── bootstrap.py
-├── run.py                   # memory CLI
-├── run_infra.py             # VS Code / Copilot infra CLI
-└── README.md
+├── tests/
+│   ├── test_conflict_resolver.py
+│   ├── test_decay.py
+│   ├── test_deduplicator.py
+│   └── test_revert_detector.py
+├── bootstrap.py              # one-time setup: creates data/ structure
+├── run.py                    # memory CLI
+├── run_infra.py              # VS Code / Copilot infra CLI
+└── server.py                 # local HTML dashboard server
 ```
 
 ---
@@ -243,17 +311,21 @@ ai_memory_system/
 
 ```json
 {
-  "id": "abc123def456",
-  "type": "bug_fix | feature | note | decision",
-  "description": "string (required)",
-  "cause": "what triggered the change",
-  "fix": "what exactly changed and where",
-  "files": ["relative/path/to/file.py"],
-  "status": "active | resolved | conflict",
-  "confidence": 0.9,
-  "timestamp": "2026-04-28T17:00:00+00:00",
+  "id":             "abc123def456",
+  "type":           "bug_fix | feature | note | decision",
+  "description":    "string (required)",
+  "cause":          "what triggered the change",
+  "fix":            "what exactly changed and where",
+  "decisions":      ["list of key decisions made"],
+  "files":          ["relative/path/to/file.py"],
+  "status":         "active | resolved | superseded | conflict",
+  "confidence":     0.9,
+  "timestamp":      "2026-05-18T10:00:00+00:00",
+  "depends_on":     ["other_entry_id"],
+  "required_by":    ["other_entry_id"],
+  "test_ids":       ["test_my_feature"],
   "conflicts_with": ["other_entry_id"],
-  "tags": ["agent", "auto", "project:my_app"]
+  "tags":           ["agent", "auto", "project:my_app"]
 }
 ```
 
@@ -277,15 +349,35 @@ Every change is recorded in `activity_log.json` with timestamp, action, affected
 from core.engine import MemoryEngine
 
 engine = MemoryEngine("data/projects/my_app")
+
+# Add an entry with a dependency link and test ID
 result = engine.add_memory({
-    "type": "decision",
+    "type":        "decision",
     "description": "Use PostgreSQL for primary store",
-    "fix": "Added pg driver and migrations",
-    "files": ["db/migrations/0001.sql"],
-    "confidence": 0.95,
+    "fix":         "Added pg driver and migrations",
+    "files":       ["db/migrations/0001.sql"],
+    "confidence":  0.95,
+    "depends_on":  ["<prior_schema_entry_id>"],
+    "test_ids":    ["test_db_connection"],
 })
-# result["entry"]     → the saved entry
-# result["conflicts"] → any conflicts detected
+# result["entry"]           → the saved entry
+# result["conflicts"]       → any conflicts detected
+# result["created_links"]   → dependency links created
+# result["suggested_links"] → similar entries worth linking
+
+# Conflict resolution
+engine.resolve_conflict(conflict_id, action="supersede_a", reason="B is the correct fix")
+
+# Dependency graph
+engine.add_dependency_link(from_id, to_id)
+engine.get_dependencies(entry_id, depth=2)
+engine.suggest_links(entry_id, threshold=0.75, top_k=5)
+
+# Maintenance operations
+engine.decay(dry_run=True, half_life_days=60, min_confidence=0.4)
+engine.deduplicate(dry_run=True, threshold=0.88)
+engine.check_stale(repo_path="C:/Projects/MyApp", min_age_days=7)
+engine.render_wiki_md()
 ```
 
 ---

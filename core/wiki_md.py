@@ -126,6 +126,27 @@ def render_entry_page(entry: Dict[str, Any]) -> str:
             lines.append(f"- `{fn}`")
         lines.append("")
 
+    depends_on = entry.get("depends_on") or []
+    if depends_on:
+        lines.append("## Depends On")
+        for did in depends_on:
+            lines.append(f"- [[entries/{did}|{did}]]")
+        lines.append("")
+
+    required_by = entry.get("required_by") or []
+    if required_by:
+        lines.append("## Required By")
+        for rid in required_by:
+            lines.append(f"- [[entries/{rid}|{rid}]]")
+        lines.append("")
+
+    test_ids = entry.get("test_ids") or []
+    if test_ids:
+        lines.append("## Linked Tests")
+        for tid in test_ids:
+            lines.append(f"- `{tid}`")
+        lines.append("")
+
     conflicts = entry.get("conflicts_with") or []
     if conflicts:
         lines.append("## Conflicts With")
@@ -141,12 +162,23 @@ def render_entry_page(entry: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def render_file_page(file_path: str, entries: List[Dict[str, Any]]) -> str:
+def render_file_page(file_path: str, entries: List[Dict[str, Any]], summary: str = "") -> str:
     lines: List[str] = [
         f"# 📂 `{file_path}`",
         "",
         f"_{len(entries)} memory entry/entries reference this file._",
         "",
+    ]
+
+    if summary:
+        lines += [
+            "## Summary",
+            "",
+            summary,
+            "",
+        ]
+
+    lines += [
         "| ID | Type | Status | Description |",
         "| -- | ---- | ------ | ----------- |",
     ]
@@ -331,11 +363,15 @@ class WikiRenderer:
             for f in e.get("files") or []:
                 by_file.setdefault(f, []).append(e)
 
+        # Read pre-computed file summaries
+        file_summaries: Dict[str, str] = self._read("file_summaries.json", {})
+
         files_written = 0
         for fpath, entries in by_file.items():
+            summary = file_summaries.get(fpath, "")
             self._write(
                 f"{FILES_DIR}/{_slug(fpath)}.md",
-                render_file_page(fpath, entries),
+                render_file_page(fpath, entries, summary=summary),
             )
             files_written += 1
 
