@@ -382,6 +382,148 @@ engine.render_wiki_md()
 
 ---
 
-## License
+## Українська (Ukrainian)
+
+### Огляд (Overview)
+
+**AI Memory System** — локальний рушій персистентної пам'яті для програмних проектів. Система запам'ятовує рішення, отримує записи про помилки та функції, виявляє суперечності та автоматично надає повний контекст проекту кожній сесії GitHub Copilot Agent в VS Code.
+
+### Ключові можливості (Key Features)
+
+- **Перехоплення подій** (SessionStart, PostToolUse) — автоматичне збереження пам'яті після кожної зміни файлу
+- **Виявлення конфліктів** — семантична схожість + евристики; дії: `supersede`, `merge`, `dismiss` з повною історією
+- **Розпад впевненості** — часова ерозія довіри до застарілих записів з можливістю попереду перегляду
+- **Семантична дедублікація** — виявлення й об'єднання дублів з контролем порога подібності
+- **Граф залежностей** — `depends_on` / `required_by` зв'язки; виявлення циклів; пропозиції посилань
+- **Автоматичні резюме файлів** — короткий огляд для кожного файлу, перегенерований при кожному add_memory
+- **Посилання на тести** — прив'язування ідентифікаторів тестів до записів
+- **Перевірка застарілості Git** — кросс-перевірка записів з історією git для виявлення застарілих знань
+- **Вікі Markdown** — автоматична генерація структурованої вікі з Obsidian-friendly `[[wikilinks]]`
+- **HTML дашбіард** — локальний веб-інтерфейс з діаграмами, графом залежностей, формою параметрів, панеллю операцій
+
+### Встановлення (Installation)
+
+```bash
+git clone https://github.com/your-org/ai_memory_system.git C:\ai_memory_system
+cd C:\ai_memory_system
+python bootstrap.py
+```
+
+### Швидкий старт (Quickstart)
+
+```bash
+# Додати запис до проекту
+python run.py --project my_app add_memory \
+  --type decision \
+  --description "Обрано PostgreSQL для основного сховища" \
+  --cause "Потреба в надійності та масштабованості" \
+  --files "db/migrations/0001.sql"
+
+# Список всіх конфліктів
+python run.py --project my_app list_conflicts
+
+# Розв'язання конфлікту
+python run.py --project my_app resolve_conflict <conflict_id> \
+  --action supersede_a \
+  --reason "Варіант A — правильне рішення"
+
+# Здійснити розпад впевненості (попередній перегляд)
+python run.py --project my_app decay --dry-run --half-life-days 60
+
+# Лінеаризація дашбіарду
+python server.py  # запуск на localhost:5001
+```
+
+### Локальне зберігання даних (Local Storage)
+
+Кожен проект зберігає свої дані ізольовано в `data/projects/<name>/`:
+
+```
+data/projects/my_app/
+├── memory.json           # всі записи
+├── conflicts.json        # виявлені конфлікти
+├── activity_log.json     # аудит кожної зміни
+├── file_summaries.json   # резюме кожного файлу
+├── settings.json         # параметри системи
+└── wiki/                 # генеровані сторінки Markdown
+    ├── index.md
+    ├── by_type/
+    ├── by_file/
+    └── entries/
+```
+
+### Схема запису пам'яті (Entry Schema)
+
+```json
+{
+  "id":             "abc123def456",
+  "type":           "bug_fix | feature | note | decision",
+  "description":    "обов'язковий текст",
+  "cause":          "що спричинило зміну",
+  "fix":            "що саме змінилось та де",
+  "files":          ["відносна/стежка/до/файлу.py"],
+  "status":         "active | resolved | superseded",
+  "confidence":     0.9,
+  "timestamp":      "2026-05-18T10:00:00+00:00",
+  "depends_on":     ["інший_id_запису"],
+  "test_ids":       ["test_мої_функції"],
+  "tags":           ["agent", "auto"]
+}
+```
+
+### Команди CLI (CLI Commands)
+
+```bash
+# Керування записами
+python run.py --project <name> add_memory        # додати запис
+python run.py --project <name> list_entries      # список записів
+python run.py --project <name> list_conflicts    # список конфліктів
+
+# Граф залежностей
+python run.py --project <name> add_link <from_id> <to_id>
+python run.py --project <name> get_dependencies <id>
+python run.py --project <name> suggest_links <id>
+
+# Операції обслуговування
+python run.py --project <name> decay             # розпад впевненості
+python run.py --project <name> deduplicate       # виявити дублі
+python run.py --project <name> render_wiki       # регенерувати вікі
+
+# Git перевірка
+python run.py --project <name> check_stale --repo-path /path/to/repo
+
+# Налаштування
+python run.py --project <name> list_settings     # показати параметри
+```
+
+### Дашбіард (HTML Dashboard)
+
+Запустіть `python server.py` на `localhost:5001` для доступу до веб-інтерфейсу:
+
+- **Dashboard** — KPI карточки та 6 діаграм (типи, часова лінія, файли, впевненість, теги, статус)
+- **Entries** — таблиця записів з фільтруванням та деталями редагування
+- **Conflicts** — карточки конфліктів з діями дозволу конфліктів
+- **Graph** — інтерактивна візуалізація графу залежностей (vis.js)
+- **Files** — список файлів з резюме та записами на файл
+- **Settings** — форма параметрів + панель операцій (decay, deduplicate, render_wiki)
+
+### Інтеграція VS Code (VS Code Integration)
+
+Файл `copilot-instructions.md` в проекті автоматично інструктує агента:
+
+```markdown
+## Memory Recording
+
+After editing a file, run:
+
+python run.py --project <project_name> add_memory \
+  --type <bug_fix|feature|note|decision> \
+  --description "<one sentence: what was done>" \
+  --files <space-separated relative paths>
+```
+
+При запуску SessionStart hook автоматично інжектує повне резюме пам'яті проекту як systemMessage.
+
+### Ліцензія (License)
 
 MIT
