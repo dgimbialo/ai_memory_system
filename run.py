@@ -234,6 +234,14 @@ def cmd_check_stale(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_stabilize_unstable(args: argparse.Namespace) -> int:
+    result = _engine(args.project).stabilize_unstable_entries(
+        min_stable_days=args.min_stable_days,
+        dry_run=args.dry_run,
+    )
+    _print(result)
+    return 0
+
 
 def cmd_update_instructions(args: argparse.Namespace) -> int:
     result = _engine(args.project).update_instructions(
@@ -500,6 +508,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Tag stale entries and write to disk (default when --dry-run is omitted)",
     )
     cs.set_defaults(func=cmd_check_stale)
+
+    su = sub.add_parser(
+        "stabilize_unstable",
+        help="Remove 'unstable' tag from entries with no revert activity for N days",
+    )
+    su.add_argument(
+        "--min-stable-days", dest="min_stable_days", type=int, default=14,
+        help="Days without revert activity required to consider an entry stable (default: 14)",
+    )
+    su.add_argument(
+        "--dry-run", dest="dry_run", action="store_true", default=False,
+        help="Show which entries would be stabilised without writing to disk",
+    )
+    su.add_argument(
+        "--apply", dest="dry_run", action="store_false",
+        help="Write changes to disk (default when --dry-run is omitted)",
+    )
+    su.set_defaults(func=cmd_stabilize_unstable)
 
     return p
 

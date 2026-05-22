@@ -261,6 +261,7 @@ class MemoryEngine:
         # Auto-decay: run once per day per project to keep confidence scores current.
         # Runs silently in the background — never blocks add_memory.
         self._maybe_auto_decay()
+        self._maybe_auto_stabilize()
 
         # Auto conflict detection: run a full scan every N new entries.
         self._maybe_auto_detect_conflicts()
@@ -337,6 +338,143 @@ class MemoryEngine:
                 )
         except Exception:
             pass  # decay is best-effort
+
+    # ---------- auto-stabilize (unstable tag removal) ----------
+
+    _STABILIZE_AUTO_INTERVAL_DAYS: float = 1.0  # run at most once per day
+    _STABILIZE_DEFAULT_MIN_DAYS: int = 14        # days without revert activity → stable
+
+    def _maybe_auto_stabilize(self) -> None:
+        """Remove 'unstable' tag from entries whose files/functions have had no
+        revert-related activity for at least _STABILIZE_DEFAULT_MIN_DAYS days.
+
+        Runs at most once per day per project; piggy-backs on wiki.json for
+        last-run bookkeeping. Failures are swallowed — never blocks add_memory.
+        """
+        try:
+            wiki_meta = self.storage.read(WIKI_FILE, default={})
+            last_run: str = wiki_meta.get("last_stabilize_run", "")
+            now = datetime.now(timezone.utc)
+            if last_run:
+                from datetime import datetime as _dt
+                last = _dt.fromisoformat(last_run)
+                if last.tzinfo is None:
+                    from datetime import timezone as _tz
+                    last = last.replace(tzinfo=_tz.utc)
+                if (now - last).total_seconds() / 86400.0 < self._STABILIZE_AUTO_INTERVAL_DAYS:
+                    return
+
+            result = self.stabilize_unstable_entries(
+                min_stable_days=self._STABILIZE_DEFAULT_MIN_DAYS,
+                dry_run=False,
+            )
+
+            wiki_meta["last_stabilize_run"] = now.isoformat()
+            self.storage.write(WIKI_FILE, wiki_meta)
+
+            if result.get("stabilized_count", 0) > 0:
+                self._log(
+                    "auto_stabilize",
+                    result["stabilized_ids"],
+                    "auto-stabilize removed 'unstable' tag from {} entries "
+                    "with no revert activity for {}+ days".format(
+                        result["stabilized_count"], self._STABILIZE_DEFAULT_MIN_DAYS
+                    ),
+                )
+        except Exception:
+            pass  # stabilize is best-effort
+
+    def stabilize_unstable_entries(
+        self,
+        min_stable_days: int = 14,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """Remove 'unstable' tag from entries that have had no revert-related
+        activity on their shared files/functions for *min_stable_days* days.
+
+        An entry is considered stable again when the most recent entry that
+        touches the same files or functions AND contains revert/add keywords is
+        older than *min_stable_days*.  The entry's own timestamp is included in
+        that search so freshly-tagged entries are never stabilised immediately.
+
+        Parameters
+        ----------
+        min_stable_days : int   Days of silence required (default 14).
+        dry_run         : bool  If True, compute but do NOT write to disk.
+
+        Returns
+        -------
+        dict with keys: dry_run, min_stable_days, stabilized_count, stabilized_ids,
+                        skipped_too_recent (list of ids that are still within the window)
+        """
+        from datetime import datetime, timezone, timedelta
+        from .revert_detector import _norm_set
+
+        memory = self._read_memory()
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=min_stable_days)
+
+        to_stabilize: List[str] = []
+        still_unstable: List[str] = []
+
+        for entry in memory:
+            if "unstable" not in (entry.get("tags") or []):
+                continue
+            if entry.get("status") in ("superseded", "resolved"):
+                continue
+
+            e_funcs = _norm_set(entry.get("functions") or [])
+            e_files = _norm_set(entry.get("files") or [])
+
+            # Determine the most recent timestamp of any entry in the same
+            # instability cluster (other unstable-tagged entries sharing files/functions).
+            # Using only unstable-tagged entries avoids false positives from _ADD_RE
+            # matching normal "added / fixed / implemented" language in every entry.
+            last_instability: Optional[datetime] = None
+
+            for other in memory:
+                if "unstable" not in (other.get("tags") or []):
+                    continue
+                o_funcs = _norm_set(other.get("functions") or [])
+                o_files = _norm_set(other.get("files") or [])
+                if not ((e_funcs and e_funcs & o_funcs) or (e_files and e_files & o_files)):
+                    continue
+                ts_str = other.get("timestamp", "")
+                try:
+                    ts = datetime.fromisoformat(ts_str)
+                    if ts.tzinfo is None:
+                        from datetime import timezone as _tz
+                        ts = ts.replace(tzinfo=_tz.utc)
+                    if last_instability is None or ts > last_instability:
+                        last_instability = ts
+                except (ValueError, TypeError):
+                    pass
+
+            if last_instability is None or last_instability < cutoff:
+                to_stabilize.append(entry["id"])
+            else:
+                still_unstable.append(entry["id"])
+
+        if not dry_run and to_stabilize:
+            stabilized_set = set(to_stabilize)
+            for entry in memory:
+                if entry.get("id") in stabilized_set:
+                    entry["tags"] = [t for t in (entry.get("tags") or []) if t != "unstable"]
+            self.storage.write(MEMORY_FILE, memory)
+            self._log(
+                "stabilize_unstable",
+                to_stabilize,
+                "removed 'unstable' tag from {} entries "
+                "(no revert activity for {}+ days)".format(len(to_stabilize), min_stable_days),
+            )
+
+        return {
+            "dry_run":            dry_run,
+            "min_stable_days":    min_stable_days,
+            "stabilized_count":   len(to_stabilize),
+            "stabilized_ids":     to_stabilize,
+            "skipped_too_recent": still_unstable,
+        }
 
     # ---------- file summaries ----------
 
