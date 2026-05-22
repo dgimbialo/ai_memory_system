@@ -1,5 +1,8 @@
 # AI Memory System
 
+> **Why does this exist?**
+> Every new AI chat session starts with a blank slate — the agent has no idea what decisions were made yesterday, which bugs were already fixed, or why the code looks the way it does. Worse, when solving a new problem the agent often breaks solutions that were carefully crafted before. This system was built to fix that. It stores not just *what* changed in each file, but *why* — what problem was being solved, how it was resolved, and how that change relates to everything else. Every edit is linked to its cause and effect, contradictions between past and present decisions are detected automatically, and all of that context is fed back into every new agent session — so the AI always knows the full history of your project.
+
 ![AI Memory System — Web Dashboard](docs/screenshot.png)
 
 A self-contained, **local** persistent memory engine for software projects, built for VS Code + GitHub Copilot Agent workflows.
