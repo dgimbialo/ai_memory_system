@@ -1,7 +1,7 @@
 /**
  * dashboard.js — KPI cards + Chart.js charts.
  */
-import { API, State, toast } from './app.js';
+import { API, State, toast, t } from './app.js';
 
 // Keep chart instances so we can destroy & recreate on project switch
 const charts = {};
@@ -82,7 +82,7 @@ function renderTimelineChart(perDay) {
     data: {
       labels: perDay.map(d => d.date.slice(5)),  // MM-DD
       datasets: [{
-        label: 'Entries',
+        label: t('chart.entries'),
         data:  perDay.map(d => d.count),
         borderColor:     '#58a6ff',
         backgroundColor: 'rgba(88,166,255,0.12)',
@@ -118,7 +118,7 @@ function renderFilesChart(topFiles) {
     data: {
       labels: names,
       datasets: [{
-        label: 'Entries',
+        label: t('chart.entries'),
         data: topFiles.map(f => f.count),
         backgroundColor: 'rgba(88,166,255,0.6)',
         borderColor: '#58a6ff',
@@ -143,8 +143,8 @@ function renderFilesChart(topFiles) {
 function renderConfidenceChart(buckets) {
   destroyChart('confidence');
   const ctx = document.getElementById('chartConfidence').getContext('2d');
-  const labels = ['0–10%','10–20%','20–30%','30–40%','40–50%',
-                   '50–60%','60–70%','70–80%','80–90%','90–100%'];
+  const labels = [t('conf.0-10'), t('conf.10-20'), t('conf.20-30'), t('conf.30-40'), t('conf.40-50'),
+                   t('conf.50-60'), t('conf.60-70'), t('conf.70-80'), t('conf.80-90'), t('conf.90-100')];
   const bgColors = buckets.map((_, i) => {
     const pct = (i + 0.5) / 10;
     if (pct >= 0.8) return 'rgba(63,185,80,0.7)';
@@ -156,7 +156,7 @@ function renderConfidenceChart(buckets) {
     type: 'bar',
     data: {
       labels,
-      datasets: [{ label: 'Entries', data: buckets, backgroundColor: bgColors, borderWidth: 0 }],
+      datasets: [{ label: t('chart.entries'), data: buckets, backgroundColor: bgColors, borderWidth: 0 }],
     },
     options: {
       scales: {
@@ -180,10 +180,10 @@ function renderTagsChart(topTags) {
   charts.tags = new Chart(ctx, {
     type: 'bar',
     data: {
-      labels: topTags.map(t => t.tag),
+      labels: topTags.map(tag => tag.tag),
       datasets: [{
-        label: 'Count',
-        data:  topTags.map(t => t.count),
+        label: t('chart.count'),
+        data:  topTags.map(tag => tag.count),
         backgroundColor: topTags.map((_, i) => colors[i % colors.length]),
         borderWidth: 0,
       }],

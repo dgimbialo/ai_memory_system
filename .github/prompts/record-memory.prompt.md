@@ -28,7 +28,7 @@ c:/python313/python.exe C:/ai_memory_system/run.py add_memory `
   --tags agent manual
 ```
 
-3. Then refresh the wiki:
+3. Then refresh the wiki (safe to call every time — skips automatically if already up to date):
 
 ```powershell
 c:/python313/python.exe C:/ai_memory_system/run.py render_wiki

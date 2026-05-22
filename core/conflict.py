@@ -150,9 +150,10 @@ def detect_conflict(a: MemoryEntry, b: MemoryEntry) -> ConflictRecord | None:
     # Rule 2: semantically opposite solutions
     opp = _opposite_terms(text_a, text_b)
     # Require real semantic similarity even if files are shared.
-    # Entries that share a file but are about completely different things
-    # (sim < 0.45) should never be flagged as 'semantically opposite'.
-    _min_opp_sim = 0.62
+    # Raised from 0.62 → 0.72 to reduce false positives on hot files
+    # that appear in many unrelated entries (e.g. a core file touched by
+    # the majority of bug fixes in the project).
+    _min_opp_sim = 0.72
     if opp and sim >= _min_opp_sim:
         if _are_sequential_steps(a, b):
             pass  # sequential steps legitimately add/remove
@@ -195,6 +196,15 @@ def find_conflicts_for(
 
 
 def find_all_conflicts(entries: List[MemoryEntry]) -> List[ConflictRecord]:
+    # Pre-compute file frequencies so detect_conflict can apply a hot-file discount.
+    # A "hot file" is one referenced by more than HOT_FILE_PCT of all entries.
+    # Conflicts detected only via shared hot files carry a weaker signal.
+    HOT_FILE_PCT = 0.20
+    total = len(entries)
+    from collections import Counter
+    file_counts: Counter = Counter(f for e in entries for f in e.files)
+    hot_files = {f for f, c in file_counts.items() if total > 0 and c / total >= HOT_FILE_PCT}
+
     out: List[ConflictRecord] = []
     seen: set = set()
     for i, a in enumerate(entries):
@@ -205,5 +215,13 @@ def find_all_conflicts(entries: List[MemoryEntry]) -> List[ConflictRecord]:
             seen.add(key)
             c = detect_conflict(a, b)
             if c:
+                # Suppress conflicts where the only shared files are hot files
+                # (high-frequency files are a poor conflict signal).
+                shared = _shared_files(a, b)
+                if shared and all(f in hot_files for f in shared):
+                    # Only suppress if it is NOT a duplicate (high-sim) conflict —
+                    # duplicates remain regardless of file frequency.
+                    if c.similarity < SIM_DUPLICATE_THRESHOLD:
+                        continue
                 out.append(c)
     return out

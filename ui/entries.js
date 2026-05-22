@@ -1,7 +1,7 @@
 /**
  * entries.js — Filterable, paginated entries table with detail panel.
  */
-import { API, State, toast, showDialog } from './app.js';
+import { API, State, toast, showDialog, t } from './app.js';
 
 const PAGE_SIZE = 50;
 let allEntries = [];
@@ -39,7 +39,7 @@ function renderTable() {
   const page  = filtered.slice(start, start + PAGE_SIZE);
   const tbody = document.getElementById('entriesBody');
   if (!page.length) {
-    tbody.innerHTML = `<tr><td colspan="6"><div class="empty-state">No entries found.</div></td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="6"><div class="empty-state">${t('entries.noEntriesFound')}</div></td></tr>`;
     return;
   }
   tbody.innerHTML = page.map(e => `

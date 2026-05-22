@@ -33,6 +33,11 @@ if TYPE_CHECKING:
 # Number of distinct add+revert pairs on the same surface before warning
 UNSTABLE_THRESHOLD = 2
 
+# Confidence penalty multiplier applied when an entry is newly tagged 'unstable'.
+# Signals instability in ranking without dropping below the decay floor.
+_UNSTABLE_CONFIDENCE_PENALTY: float = 0.85
+_MIN_CONF_FLOOR: float = 0.40
+
 _ADD_RE = re.compile(
     r"\b(add|added|implement|implemented|enable|enabled|create|created|"
     r"introduce|introduced|support|supports|activate|activated)\b",
@@ -145,11 +150,25 @@ class RevertDetector:
             new_files & _union_norm_sets(e.get("files") or [] for e in candidates)
         )
 
-        # Tag all related entries as "unstable"
+        # Tag all related entries as "unstable" (only those not already tagged)
         related_ids = [e["id"] for e in add_entries + revert_entries if e.get("id") != new_id]
-        self._tag_unstable(related_ids + [new_id])
+        all_ids = related_ids + [new_id]
+
+        # Optimisation: skip the write if every entry is already tagged unstable
+        all_already_tagged = all(
+            "unstable" in (e.get("tags") or [])
+            for e in add_entries + revert_entries
+            if e.get("id") in set(all_ids)
+        ) and "unstable" in (new_entry_dict.get("tags") or [])
+
+        if not all_already_tagged:
+            self._tag_unstable(all_ids)
 
         surface = ", ".join(unstable_funcs) or ", ".join(unstable_files)
+        newly_tagged_count = sum(
+            1 for e in add_entries + revert_entries + [new_entry_dict]
+            if "unstable" not in (e.get("tags") or [])
+        )
         message = (
             "WARNING: '{}' has been added/reverted {} time(s). "
             "Tag 'unstable' applied to {} related entries. "
@@ -169,24 +188,38 @@ class RevertDetector:
     # ------------------------------------------------------------------
 
     def _tag_unstable(self, entry_ids: List[str]) -> None:
-        """Add 'unstable' tag to all given entry ids in memory."""
+        """Add 'unstable' tag to all given entry ids in memory.
+
+        Only entries that do not already carry the tag are modified.
+        Newly tagged entries also have their confidence reduced by
+        UNSTABLE_CONFIDENCE_PENALTY (×0.85) so that repeated add/revert
+        churn is reflected in the ranking score.
+        The activity log reports the count of *newly* tagged entries,
+        not the total number of IDs passed in.
+        """
         if not entry_ids:
             return
         memory = self._engine._read_memory()
         ids_set = set(entry_ids)
-        changed = False
+        newly_tagged: List[str] = []
         for e in memory:
             if e.get("id") in ids_set:
                 tags: List[str] = e.get("tags") or []
                 if "unstable" not in tags:
                     e["tags"] = tags + ["unstable"]
-                    changed = True
-        if changed:
+                    # Reduce confidence to signal instability — cap at MIN_CONFIDENCE
+                    orig = float(e.get("confidence") or 0.5)
+                    penalised = round(max(orig * _UNSTABLE_CONFIDENCE_PENALTY, _MIN_CONF_FLOOR), 4)
+                    e["confidence"] = penalised
+                    newly_tagged.append(e["id"])
+        if newly_tagged:
             self._engine.storage.write("memory.json", memory)
             self._engine._log(
                 "tag_unstable",
-                list(ids_set),
-                "revert pattern detected; tagged {} entries as unstable".format(len(ids_set)),
+                newly_tagged,
+                "revert pattern detected; tagged {} new entries as unstable".format(
+                    len(newly_tagged)
+                ),
             )
 
 

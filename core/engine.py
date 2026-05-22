@@ -24,6 +24,113 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# ---------------------------------------------------------------------------
+# Auto-tagging helpers
+# ---------------------------------------------------------------------------
+
+# Maps keyword substrings (lowercased) → tag to add when found in description/cause/fix.
+# Order matters: first match wins per keyword group.
+_KEYWORD_TAGS: List[tuple] = [
+    # errors & stability
+    ("crash",          "crash"),
+    ("exception",      "exception"),
+    ("memory leak",    "memory-leak"),
+    ("null pointer",   "null-pointer"),
+    # code health
+    ("refactor",       "refactor"),
+    ("cleanup",        "refactor"),
+    ("deprecat",       "deprecation"),
+    # reversals
+    ("revert",         "revert"),
+    ("rollback",       "revert"),
+    # performance
+    ("performance",    "performance"),
+    ("slow",           "performance"),
+    ("optimiz",        "performance"),
+    ("optimis",        "performance"),
+    ("cache",          "caching"),
+    ("caching",        "caching"),
+    # concurrency
+    ("async",          "concurrency"),
+    ("thread",         "concurrency"),
+    ("race condition", "concurrency"),
+    ("deadlock",       "concurrency"),
+    # security
+    ("security",       "security"),
+    ("auth",           "auth"),
+    ("permission",     "auth"),
+    ("token",          "auth"),
+    ("sql injection",  "security"),
+    # data & storage
+    ("database",       "database"),
+    ("migration",      "migration"),
+    ("schema",         "database"),
+    ("query",          "database"),
+    # api & networking
+    ("api",            "api"),
+    ("endpoint",       "api"),
+    ("http",           "api"),
+    ("request",        "api"),
+    # configuration
+    ("config",         "config"),
+    ("settings",       "config"),
+    ("environment",    "config"),
+    ("env var",        "config"),
+    # testing
+    ("test",           "testing"),
+    ("assert",         "testing"),
+    ("mock",           "testing"),
+    # dependencies
+    ("dependency",     "dependency"),
+    ("import",         "dependency"),
+    ("package",        "dependency"),
+    ("library",        "dependency"),
+    # ui / frontend
+    ("frontend",       "frontend"),
+    ("ui",             "frontend"),
+    ("component",      "frontend"),
+    ("render",         "frontend"),
+    # deployment
+    ("deploy",         "deployment"),
+    ("release",        "deployment"),
+    ("build",          "deployment"),
+    ("pipeline",       "deployment"),
+    # logging & observability
+    ("logging",        "logging"),
+    ("log",            "logging"),
+    ("monitor",        "logging"),
+    ("trace",          "logging"),
+    # validation
+    ("validat",        "validation"),
+    ("saniti",         "validation"),
+]
+
+import re as _re
+
+
+def _auto_tag_from_description(entry: "MemoryEntry") -> List[str]:
+    """Return tags to add based on keywords in description, cause, and fix.
+
+    Only tags that are not already on the entry are returned.
+    """
+    text = " ".join(filter(None, [
+        entry.description or "",
+        entry.cause or "",
+        entry.fix or "",
+    ])).lower()
+
+    existing = set(entry.tags or [])
+    added: List[str] = []
+    seen_tags: set = set()
+    for keyword, tag in _KEYWORD_TAGS:
+        if tag in seen_tags or tag in existing:
+            continue
+        if keyword in text:
+            added.append(tag)
+            seen_tags.add(tag)
+    return added
+
+
 class MemoryEngine:
     def __init__(self, data_dir: str | Path):
         self.storage = Storage(data_dir)
@@ -76,6 +183,16 @@ class MemoryEngine:
 
         entry = MemoryEntry.from_dict(payload) if not isinstance(payload, MemoryEntry) else payload
         entry.validate()
+
+        # Enrich tags automatically from description/cause/fix keywords.
+        # Only adds tags not already present — never removes user-supplied tags.
+        _auto_tags = _auto_tag_from_description(entry)
+        if _auto_tags:
+            combined = list(entry.tags)
+            for t in _auto_tags:
+                if t not in combined:
+                    combined.append(t)
+            entry.tags = combined
 
         memory = self._read_memory()
         existing_entries = [MemoryEntry.from_dict(e) for e in memory]
@@ -141,6 +258,13 @@ class MemoryEngine:
         if entry.files:
             self._update_file_summaries(entry.files)
 
+        # Auto-decay: run once per day per project to keep confidence scores current.
+        # Runs silently in the background — never blocks add_memory.
+        self._maybe_auto_decay()
+
+        # Auto conflict detection: run a full scan every N new entries.
+        self._maybe_auto_detect_conflicts()
+
         return {
             "entry":           entry.to_dict(),
             "conflicts":       [c.to_dict() for c in conflicts],
@@ -148,6 +272,71 @@ class MemoryEngine:
             "created_links":   created_links,
             "suggested_links": suggested_links,
         }
+
+    # ---------- auto conflict detection ----------
+
+    _CONFLICT_AUTO_TRIGGER_EVERY_N: int = 15  # run detect_conflicts every N new entries
+
+    def _maybe_auto_detect_conflicts(self) -> None:
+        """Run a full conflict scan when every N-th entry is added.
+
+        Uses the total active-entry count as a trigger.  Stores nothing extra —
+        the counter is derived from memory length so it is always consistent.
+        Failures are swallowed — never blocks add_memory.
+        """
+        try:
+            memory = self._read_memory()
+            active_count = sum(
+                1 for e in memory
+                if e.get("status") not in {"superseded", "resolved"}
+            )
+            if active_count % self._CONFLICT_AUTO_TRIGGER_EVERY_N == 0:
+                self.detect_conflicts()
+        except Exception:
+            pass  # best-effort
+
+    # ---------- auto-decay ----------
+
+    _DECAY_AUTO_INTERVAL_DAYS: float = 1.0  # run at most once per day per project
+
+    def _maybe_auto_decay(self) -> None:
+        """Run decay if it hasn't run in the last DECAY_AUTO_INTERVAL_DAYS days.
+
+        Stores ``last_decay_run`` in wiki.json so the check is cheap (one read).
+        Failures are swallowed — decay is best-effort and must never block add_memory.
+        """
+        try:
+            wiki_meta = self.storage.read(WIKI_FILE, default={})
+            last_decay_run: str = wiki_meta.get("last_decay_run", "")
+            now = datetime.now(timezone.utc)
+            if last_decay_run:
+                from datetime import datetime as _dt
+                last = _dt.fromisoformat(last_decay_run)
+                if last.tzinfo is None:
+                    from datetime import timezone as _tz
+                    last = last.replace(tzinfo=_tz.utc)
+                age_days = (now - last).total_seconds() / 86400.0
+                if age_days < self._DECAY_AUTO_INTERVAL_DAYS:
+                    return  # already ran recently
+
+            from .decay import DecayEngine
+            result = DecayEngine(self).apply(dry_run=False)
+
+            # Update the timestamp regardless of whether any entries changed,
+            # so we don't re-check on every subsequent add_memory today.
+            wiki_meta["last_decay_run"] = now.isoformat()
+            self.storage.write(WIKI_FILE, wiki_meta)
+
+            if result.get("changed_count", 0) > 0:
+                self._log(
+                    "auto_decay",
+                    [],
+                    "auto-decay updated {} entry confidence(s)".format(
+                        result["changed_count"]
+                    ),
+                )
+        except Exception:
+            pass  # decay is best-effort
 
     # ---------- file summaries ----------
 
@@ -217,8 +406,40 @@ class MemoryEngine:
             out = [e for e in out if e.get("status") == status]
         return out
 
+    def heal_orphaned_conflict_entries(self) -> List[str]:
+        """Reset entries stuck at status='conflict' that have no matching conflict record.
+
+        This can happen when a conflict record is manually deleted or replaced
+        without updating the linked entries.  Returns the list of healed entry ids.
+        """
+        memory = self._read_memory()
+        conflicts = self._read_conflicts()
+        conflict_entry_ids: set = set()
+        for c in conflicts:
+            conflict_entry_ids.add(c.get("entry_a"))
+            conflict_entry_ids.add(c.get("entry_b"))
+
+        healed: List[str] = []
+        for e in memory:
+            if e.get("status") == "conflict" and e.get("id") not in conflict_entry_ids:
+                self.updater.update_status(memory, e["id"], "active")
+                healed.append(e["id"])
+
+        if healed:
+            self.storage.write(MEMORY_FILE, memory)
+            self._log(
+                "heal_orphaned_conflicts",
+                healed,
+                "reset {} orphaned conflict-status entries to active".format(len(healed)),
+            )
+        return healed
+
     def detect_conflicts(self) -> List[Dict[str, Any]]:
         """Re-scan all memory and refresh conflicts.json."""
+        # Heal any entries stuck in conflict status without a matching record
+        # before running the new detection pass.
+        self.heal_orphaned_conflict_entries()
+
         memory = self._read_memory()
         entries = [MemoryEntry.from_dict(e) for e in memory]
         conflicts = find_all_conflicts(entries)
@@ -601,9 +822,36 @@ class MemoryEngine:
 
     # ---------- markdown projection ----------
     def render_wiki_md(self) -> Dict[str, Any]:
-        """Regenerate the markdown wiki under data/wiki/."""
+        """Regenerate the markdown wiki under data/wiki/.
+
+        Skips rendering if no entries have been added or modified since the
+        last render.  This makes it safe to call after every ``add_memory``
+        without wasting I/O on unchanged data.
+        """
+        # --- dirty check ---
+        wiki_meta = self.storage.read(WIKI_FILE, default={})
+        last_rendered_at: str = wiki_meta.get("last_rendered_at", "")
+
+        if last_rendered_at:
+            memory = self._read_memory()
+            latest_ts = max(
+                (e.get("timestamp", "") for e in memory),
+                default="",
+            )
+            if latest_ts and latest_ts <= last_rendered_at:
+                return {
+                    "skipped": True,
+                    "reason": "wiki already up to date",
+                    "last_rendered_at": last_rendered_at,
+                }
+
         renderer = WikiRenderer(self.storage.data_dir)
         report = renderer.render_all()
+
+        # Persist the render timestamp so future calls can skip if unchanged
+        wiki_meta["last_rendered_at"] = _now()
+        self.storage.write(WIKI_FILE, wiki_meta)
+
         self._log(
             action="render_wiki_md",
             affected=[],

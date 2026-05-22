@@ -50,6 +50,11 @@ After `add_memory`, also run:
 c:/python313/python.exe C:/ai_memory_system/run.py --project <project_name> render_wiki
 ```
 
+> `render_wiki` is a **no-op** when nothing has changed since the last render —
+> it is safe to call every time and will skip automatically if the wiki is already
+> up to date.  Run it explicitly at the end of each session or when you need fresh
+> markdown output.
+
 > The `PostToolUse` hook (`memory.json`) runs `hook_handler.py` automatically.  
 > Use the manual command above when the hook is not active or for richer metadata.
 

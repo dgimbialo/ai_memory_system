@@ -190,15 +190,16 @@ class TestResolveDismiss:
 
         result = engine.resolve_conflict(cid, "dismiss", "false positive")
         assert result["action"] == "dismiss"
-        assert result["affected_entries"] == []
+        # dismiss restores both entries to active — affected_entries contains both
+        assert set(result["affected_entries"]) == {id_a, id_b}
 
         remaining = [c for c in engine._read_conflicts() if c.get("id") == cid]
         assert remaining == []
 
-        # Both entries must NOT be superseded
+        # Both entries must be active (not superseded, not stuck in conflict)
         mem = {e["id"]: e for e in engine._read_memory()}
-        assert mem[id_a]["status"] != "superseded"
-        assert mem[id_b]["status"] != "superseded"
+        assert mem[id_a]["status"] == "active"
+        assert mem[id_b]["status"] == "active"
 
 
 # ---------------------------------------------------------------------------

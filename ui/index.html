@@ -13,21 +13,28 @@
   <header class="app-header">
     <div class="brand">🧠 AI Memory System</div>
     <div class="header-controls">
-      <label class="header-label" for="projectSelect">Project</label>
+      <label class="header-label" for="projectSelect" data-i18n="header.project">Project</label>
       <select id="projectSelect" class="select-box"></select>
-      <button class="btn btn-ghost" id="refreshBtn" title="Refresh data">↻</button>
+      <select id="langSelect" class="select-box" title="Select language" style="width: 140px;">
+        <option value="en">English</option>
+        <option value="uk">Українська</option>
+      </select>
+      <button class="btn btn-ghost" id="refreshBtn" title="Refresh data" data-i18n-title="header.refresh">↻</button>
     </div>
   </header>
 
   <!-- ── Tab Navigation ── -->
   <nav class="tab-nav" id="tabNav">
-    <button class="tab-btn active" data-tab="dashboard">📊 Dashboard</button>
-    <button class="tab-btn" data-tab="entries">📝 Entries</button>
-    <button class="tab-btn" data-tab="conflicts">
+    <button class="tab-btn active" data-tab="dashboard" data-i18n="tab.dashboard">📊 Dashboard</button>
+    <button class="tab-btn" data-tab="entries" data-i18n="tab.entries">📝 Entries</button>
+    <button class="tab-btn" data-tab="conflicts" data-i18n="tab.conflicts">
       ⚠️ Conflicts
       <span class="badge" id="conflictBadge" style="display:none"></span>
     </button>
-    <button class="tab-btn" data-tab="graph">🔗 Graph</button>
+    <button class="tab-btn" data-tab="graph" data-i18n="tab.graph">🔗 Graph</button>
+    <button class="tab-btn" data-tab="files" data-i18n="tab.files">📂 Files</button>
+    <button class="tab-btn" data-tab="settings" data-i18n="tab.settings">⚙️ Settings</button>
+  </nav>
     <button class="tab-btn" data-tab="files">📂 Files</button>
     <button class="tab-btn" data-tab="settings">⚙️ Settings</button>
   </nav>
@@ -38,59 +45,59 @@
     <!-- Tab: Dashboard -->
     <div class="tab-pane active" id="tab-dashboard">
       <div id="conflictBanner" class="banner banner-warn" style="display:none">
-        <strong>⚠️ Open Conflicts:</strong>
-        <span id="bannerConflictCount"></span> unresolved —
-        <a href="#" data-goto="conflicts">resolve now</a>
+        <strong>⚠️ <span data-i18n="dashboard.conflictBanner">Open Conflicts:</span></strong>
+        <span id="bannerConflictCount"></span> <span data-i18n="dashboard.unresolved">unresolved —</span>
+        <a href="#" data-goto="conflicts" data-i18n="dashboard.resolveNow">resolve now</a>
       </div>
       <div class="kpi-grid" id="kpiGrid">
         <div class="kpi-card" id="kpi-total">
-          <div class="kpi-value">—</div><div class="kpi-label">Total Entries</div>
+          <div class="kpi-value">—</div><div class="kpi-label" data-i18n="kpi.totalEntries">Total Entries</div>
         </div>
         <div class="kpi-card" id="kpi-bugs">
-          <div class="kpi-value">—</div><div class="kpi-label">Bug Fixes</div>
+          <div class="kpi-value">—</div><div class="kpi-label" data-i18n="kpi.bugFixes">Bug Fixes</div>
         </div>
         <div class="kpi-card" id="kpi-features">
-          <div class="kpi-value">—</div><div class="kpi-label">Features</div>
+          <div class="kpi-value">—</div><div class="kpi-label" data-i18n="kpi.features">Features</div>
         </div>
         <div class="kpi-card" id="kpi-decisions">
-          <div class="kpi-value">—</div><div class="kpi-label">Decisions</div>
+          <div class="kpi-value">—</div><div class="kpi-label" data-i18n="kpi.decisions">Decisions</div>
         </div>
         <div class="kpi-card" id="kpi-confidence">
-          <div class="kpi-value">—</div><div class="kpi-label">Avg Confidence</div>
+          <div class="kpi-value">—</div><div class="kpi-label" data-i18n="kpi.avgConfidence">Avg Confidence</div>
         </div>
         <div class="kpi-card kpi-warn" id="kpi-conflicts">
-          <div class="kpi-value">—</div><div class="kpi-label">Open Conflicts</div>
+          <div class="kpi-value">—</div><div class="kpi-label" data-i18n="kpi.openConflicts">Open Conflicts</div>
         </div>
         <div class="kpi-card" id="kpi-linked">
-          <div class="kpi-value">—</div><div class="kpi-label">Linked Entries</div>
+          <div class="kpi-value">—</div><div class="kpi-label" data-i18n="kpi.linkedEntries">Linked Entries</div>
         </div>
         <div class="kpi-card" id="kpi-active">
-          <div class="kpi-value">—</div><div class="kpi-label">Active Entries</div>
+          <div class="kpi-value">—</div><div class="kpi-label" data-i18n="kpi.activeEntries">Active Entries</div>
         </div>
       </div>
       <div class="charts-grid">
         <div class="chart-card">
-          <h3 class="chart-title">Entry Types</h3>
+          <h3 class="chart-title" data-i18n="chart.entryTypes">Entry Types</h3>
           <div class="chart-wrap"><canvas id="chartTypes"></canvas></div>
         </div>
         <div class="chart-card">
-          <h3 class="chart-title">Activity (last 30 days)</h3>
+          <h3 class="chart-title" data-i18n="chart.activity">Activity (last 30 days)</h3>
           <div class="chart-wrap"><canvas id="chartTimeline"></canvas></div>
         </div>
         <div class="chart-card">
-          <h3 class="chart-title">Top 10 Files</h3>
+          <h3 class="chart-title" data-i18n="chart.topFiles">Top 10 Files</h3>
           <div class="chart-wrap"><canvas id="chartFiles"></canvas></div>
         </div>
         <div class="chart-card">
-          <h3 class="chart-title">Confidence Distribution</h3>
+          <h3 class="chart-title" data-i18n="chart.confidenceDistribution">Confidence Distribution</h3>
           <div class="chart-wrap"><canvas id="chartConfidence"></canvas></div>
         </div>
         <div class="chart-card chart-card-wide">
-          <h3 class="chart-title">Top Tags</h3>
+          <h3 class="chart-title" data-i18n="chart.topTags">Top Tags</h3>
           <div class="chart-wrap"><canvas id="chartTags"></canvas></div>
         </div>
         <div class="chart-card">
-          <h3 class="chart-title">Status Breakdown</h3>
+          <h3 class="chart-title" data-i18n="chart.statusBreakdown">Status Breakdown</h3>
           <div class="chart-wrap"><canvas id="chartStatus"></canvas></div>
         </div>
       </div>
@@ -99,33 +106,33 @@
     <!-- Tab: Entries -->
     <div class="tab-pane hidden" id="tab-entries">
       <div class="toolbar">
-        <input type="text" id="entrySearch" class="search-box" placeholder="🔍 Search entries…">
+        <input type="text" id="entrySearch" class="search-box" data-i18n-placeholder="entries.search" placeholder="🔍 Search entries…">
         <select id="filterType" class="select-box">
-          <option value="">All types</option>
-          <option value="bug_fix">Bug Fix</option>
-          <option value="feature">Feature</option>
-          <option value="decision">Decision</option>
-          <option value="note">Note</option>
+          <option value="" data-i18n="entries.all">All types</option>
+          <option value="bug_fix" data-i18n="entries.bugFix">Bug Fix</option>
+          <option value="feature" data-i18n="entries.feature">Feature</option>
+          <option value="decision" data-i18n="entries.decision">Decision</option>
+          <option value="note" data-i18n="entries.note">Note</option>
         </select>
         <select id="filterStatus" class="select-box">
-          <option value="">All statuses</option>
-          <option value="active">Active</option>
-          <option value="resolved">Resolved</option>
-          <option value="superseded">Superseded</option>
-          <option value="conflict">Conflict</option>
+          <option value="" data-i18n="entries.all">All statuses</option>
+          <option value="active" data-i18n="status.active">Active</option>
+          <option value="resolved" data-i18n="status.resolved">Resolved</option>
+          <option value="superseded" data-i18n="status.superseded">Superseded</option>
+          <option value="conflict" data-i18n="status.conflict">Conflict</option>
         </select>
         <input type="text" id="filterFile" class="search-box" placeholder="File filter…">
         <input type="text" id="filterTag" class="search-box" placeholder="Tag filter…">
-        <button class="btn btn-primary" id="applyFilters">Apply</button>
-        <button class="btn btn-ghost" id="clearFilters">Clear</button>
+        <button class="btn btn-primary" id="applyFilters" data-i18n="detail.save">Apply</button>
+        <button class="btn btn-ghost" id="clearFilters" data-i18n="detail.cancel">Clear</button>
       </div>
       <div class="entries-layout">
         <div class="entries-list-wrap">
           <table class="data-table" id="entriesTable">
             <thead>
               <tr>
-                <th>Type</th><th>Status</th><th>Confidence</th>
-                <th>Description</th><th>Files</th><th>Date</th>
+                <th data-i18n="entries.type">Type</th><th data-i18n="entries.status">Status</th><th data-i18n="entries.confidence">Confidence</th>
+                <th data-i18n="entries.description">Description</th><th data-i18n="entries.files">Files</th><th data-i18n="entries.date">Date</th>
               </tr>
             </thead>
             <tbody id="entriesBody"></tbody>
@@ -151,20 +158,20 @@
     <!-- Tab: Graph -->
     <div class="tab-pane hidden" id="tab-graph">
       <div class="graph-toolbar">
-        <span class="toolbar-label">Filter type:</span>
-        <label><input type="checkbox" class="graph-type-filter" value="decision" checked> Decision</label>
-        <label><input type="checkbox" class="graph-type-filter" value="bug_fix" checked> Bug Fix</label>
-        <label><input type="checkbox" class="graph-type-filter" value="feature" checked> Feature</label>
-        <label><input type="checkbox" class="graph-type-filter" value="note" checked> Note</label>
-        <span class="toolbar-label">Status:</span>
-        <label><input type="checkbox" id="hideSuperseded" checked> Hide superseded</label>
-        <label class="graph-conf-label">Min conf:
+        <span class="toolbar-label" data-i18n="graph.filterType">Filter type:</span>
+        <label><input type="checkbox" class="graph-type-filter" value="decision" checked> <span data-i18n="graph.decision">Decision</span></label>
+        <label><input type="checkbox" class="graph-type-filter" value="bug_fix" checked> <span data-i18n="graph.bugFix">Bug Fix</span></label>
+        <label><input type="checkbox" class="graph-type-filter" value="feature" checked> <span data-i18n="graph.feature">Feature</span></label>
+        <label><input type="checkbox" class="graph-type-filter" value="note" checked> <span data-i18n="graph.note">Note</span></label>
+        <span class="toolbar-label" data-i18n="entries.filterStatus">Status:</span>
+        <label><input type="checkbox" id="hideSuperseded" checked> <span data-i18n="graph.hideSuperseded">Hide superseded</span></label>
+        <label class="graph-conf-label"><span data-i18n="graph.minConfidence">Min conf:</span>
           <input type="range" id="graphMinConf" min="0" max="1" step="0.1" value="0">
           <span id="graphMinConfVal">0.0</span>
         </label>
-        <button class="btn btn-ghost" id="graphPhysicsToggle">⏸ Pause physics</button>
-        <button class="btn btn-ghost" id="graphFit">⊡ Fit</button>
-        <button class="btn btn-ghost" id="graphReload">↻ Reload</button>
+        <button class="btn btn-ghost" id="graphPhysicsToggle" data-i18n="graph.pausePhysics">⏸ Pause physics</button>
+        <button class="btn btn-ghost" id="graphFit" data-i18n="graph.fit">⊡ Fit</button>
+        <button class="btn btn-ghost" id="graphReload" data-i18n="graph.reload">↻ Reload</button>
       </div>
       <div class="graph-layout">
         <div id="graphContainer" class="graph-canvas"></div>
@@ -186,8 +193,8 @@
       <div class="toolbar">
         <input type="text" id="fileSearch" class="search-box" placeholder="🔍 Filter files…">
         <select id="fileSortBy" class="select-box">
-          <option value="count">Sort by entry count</option>
-          <option value="name">Sort by name</option>
+          <option value="count" data-i18n="files.sortByCount">Sort by entry count</option>
+          <option value="name" data-i18n="files.sortByName">Sort by name</option>
         </select>
       </div>
       <div class="files-layout">
@@ -205,87 +212,87 @@
         <form id="settingsForm" class="settings-form">
 
           <section class="settings-section">
-            <h3>🕒 Confidence Decay</h3>
+            <h3>🕒 <span data-i18n="settings.confidenceDecay">Confidence Decay</span></h3>
             <label class="toggle-row">
-              <span>Enable decay</span>
+              <span data-i18n="settings.enableDecay">Enable decay</span>
               <input type="checkbox" id="decayEnabled" name="decayEnabled">
             </label>
             <label class="field-row">
-              <span>Half-life (days)</span>
+              <span data-i18n="settings.halfLife">Half-life (days)</span>
               <input type="number" id="decayHalfLife" min="1" max="365" step="1" value="60">
             </label>
             <label class="field-row">
-              <span>Minimum confidence floor</span>
+              <span data-i18n="settings.minConfFloor">Minimum confidence floor</span>
               <input type="number" id="decayMinConf" min="0" max="1" step="0.05" value="0.40">
             </label>
           </section>
 
           <section class="settings-section">
-            <h3>🔁 Semantic Deduplication</h3>
+            <h3>🔁 <span data-i18n="settings.semanticDeduplicate">Semantic Deduplication</span></h3>
             <label class="toggle-row">
-              <span>Enable deduplication</span>
+              <span data-i18n="settings.enableDeduplicate">Enable deduplication</span>
               <input type="checkbox" id="dedupEnabled" name="dedupEnabled">
             </label>
             <label class="field-row">
-              <span>Similarity threshold</span>
+              <span data-i18n="settings.similarityThreshold">Similarity threshold</span>
               <input type="number" id="dedupThreshold" min="0.5" max="1" step="0.01" value="0.88">
             </label>
           </section>
 
           <section class="settings-section">
-            <h3>↩️ Revert Detection</h3>
+            <h3>↩️ <span data-i18n="settings.revertDetection">Revert Detection</span></h3>
             <label class="toggle-row">
-              <span>Enable revert detection</span>
+              <span data-i18n="settings.enableRevertDetection">Enable revert detection</span>
               <input type="checkbox" id="revertEnabled" name="revertEnabled">
             </label>
             <label class="field-row">
-              <span>Revert pair threshold</span>
+              <span data-i18n="settings.revertPairThreshold">Revert pair threshold</span>
               <input type="number" id="revertThreshold" min="1" max="10" step="1" value="2">
             </label>
           </section>
 
           <section class="settings-section">
-            <h3>🔍 Stale Entry Check</h3>
+            <h3>🔍 <span data-i18n="settings.staleEntryCheck">Stale Entry Check</span></h3>
             <label class="field-row">
-              <span>Minimum entry age (days)</span>
+              <span data-i18n="settings.minEntryAge">Minimum entry age (days)</span>
               <input type="number" id="staleMinAge" min="1" max="365" step="1" value="7">
             </label>
           </section>
 
           <section class="settings-section">
-            <h3>📖 Wiki</h3>
+            <h3>📖 <span data-i18n="settings.wiki">Wiki</span></h3>
             <label class="toggle-row">
-              <span>Auto-render wiki on add_memory</span>
+              <span data-i18n="settings.autoRenderWiki">Auto-render wiki on add_memory</span>
               <input type="checkbox" id="wikiAutoRender" name="wikiAutoRender">
             </label>
           </section>
 
           <section class="settings-section">
-            <h3>🔎 Query</h3>
+            <h3>🔎 <span data-i18n="settings.query">Query</span></h3>
             <label class="field-row">
-              <span>Default top-k results</span>
+              <span data-i18n="settings.defaultTopK">Default top-k results</span>
               <input type="number" id="queryTopK" min="1" max="50" step="1" value="10">
             </label>
             <label class="field-row">
-              <span>Decay blend weight (0–1)</span>
+              <span data-i18n="settings.decayBlendWeight">Decay blend weight (0–1)</span>
               <input type="number" id="queryDecayBlend" min="0" max="1" step="0.05" value="0.10">
             </label>
           </section>
 
           <section class="settings-section">
-            <h3>🏷️ Default Tags</h3>
+            <h3>🏷️ <span data-i18n="settings.defaultTags">Default Tags</span></h3>
             <div class="tag-editor" id="defaultTagsEditor">
               <div class="tag-list" id="defaultTagsList"></div>
               <div class="tag-add-row">
-                <input type="text" id="tagInput" class="search-box" placeholder="New tag…">
-                <button type="button" class="btn btn-ghost" id="addTagBtn">+ Add</button>
+                <input type="text" id="tagInput" class="search-box" data-i18n-placeholder="settings.newTag" placeholder="New tag…">
+                <button type="button" class="btn btn-ghost" id="addTagBtn" data-i18n="settings.addNewTag">+ Add</button>
               </div>
             </div>
           </section>
 
           <div class="settings-actions">
-            <button type="submit" class="btn btn-primary">💾 Save Settings</button>
-            <button type="button" class="btn btn-ghost" id="resetSettings">Reset to defaults</button>
+            <button type="submit" class="btn btn-primary" data-i18n="settings.saveSettings">💾 Save Settings</button>
+            <button type="button" class="btn btn-ghost" id="resetSettings" data-i18n="settings.resetDefaults">Reset to defaults</button>
           </div>
         </form>
 
@@ -294,33 +301,33 @@
           <h3>⚡ Operations</h3>
 
           <div class="op-card">
-            <h4>Confidence Decay</h4>
-            <p>Apply time-based decay to stale entries.</p>
+            <h4 data-i18n="settings.confidenceDecay">Confidence Decay</h4>
+            <p data-i18n="op.decayDesc">Apply time-based decay to stale entries.</p>
             <div class="op-controls">
-              <label><input type="checkbox" id="opDecayDryRun" checked> Dry run</label>
+              <label><input type="checkbox" id="opDecayDryRun" checked> <span data-i18n="settings.dryRun">Dry run</span></label>
             </div>
-            <button class="btn btn-secondary" data-op="decay">Run Decay</button>
+            <button class="btn btn-secondary" data-op="decay" data-i18n="op.runDecay">Run Decay</button>
           </div>
 
           <div class="op-card">
-            <h4>Deduplication</h4>
-            <p>Find and merge near-duplicate entries.</p>
+            <h4 data-i18n="settings.semanticDeduplicate">Deduplication</h4>
+            <p data-i18n="op.dedupDesc">Find and merge near-duplicate entries.</p>
             <div class="op-controls">
-              <label><input type="checkbox" id="opDedupDryRun" checked> Dry run</label>
+              <label><input type="checkbox" id="opDedupDryRun" checked> <span data-i18n="settings.dryRun">Dry run</span></label>
             </div>
-            <button class="btn btn-secondary" data-op="deduplicate">Run Deduplication</button>
+            <button class="btn btn-secondary" data-op="deduplicate" data-i18n="op.runDedup">Run Deduplication</button>
           </div>
 
           <div class="op-card">
-            <h4>Render Wiki</h4>
-            <p>Regenerate all markdown wiki pages.</p>
-            <button class="btn btn-secondary" data-op="render_wiki">Render Wiki</button>
+            <h4 data-i18n="settings.wiki">Render Wiki</h4>
+            <p data-i18n="op.wikiDesc">Regenerate all markdown wiki pages.</p>
+            <button class="btn btn-secondary" data-op="render_wiki" data-i18n="op.renderWiki">Render Wiki</button>
           </div>
 
           <div class="op-card">
-            <h4>Lint Check</h4>
-            <p>Run health checks on the memory store.</p>
-            <button class="btn btn-secondary" data-op="lint">Run Lint</button>
+            <h4 data-i18n="op.lintCheck">Lint Check</h4>
+            <p data-i18n="op.lintDesc">Run health checks on the memory store.</p>
+            <button class="btn btn-secondary" data-op="lint" data-i18n="op.runLint">Run Lint</button>
           </div>
 
           <div class="op-result hidden" id="opResult">
@@ -346,6 +353,32 @@
         <button class="btn btn-primary" id="dialogConfirm">Confirm</button>
         <button class="btn btn-ghost" id="dialogCancel">Cancel</button>
       </div>
+    </div>
+  </div>
+
+  <!-- ── Conflict Comparison Modal (Resizable) ── -->
+  <div class="dialog-overlay hidden" id="conflictCompareOverlay" style="display:flex;align-items:center;justify-content:center;z-index:1000">
+    <div id="conflictCompareModal" style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);display:flex;flex-direction:column;width:900px;max-height:700px;resize:both;overflow:hidden;touch-action:none;box-shadow:0 10px 40px rgba(0,0,0,0.3)">
+      <!-- Header with drag handle -->
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 20px;border-bottom:1px solid var(--border);cursor:move;user-select:none;background:linear-gradient(135deg,var(--surface),var(--surface2))" id="conflictCompareHeader">
+        <div style="flex:1;font-weight:600;color:var(--text)" data-i18n="conflicts.compareTitle">Compare Conflict Entries</div>
+        <button style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:20px;width:32px;height:32px;display:flex;align-items:center;justify-content:center;padding:0" onclick="document.getElementById('conflictCompareOverlay').classList.add('hidden')">✕</button>
+      </div>
+      
+      <!-- Entries comparison (top) -->
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:0;flex:1;overflow:auto;min-height:300px">
+        <!-- Entry A -->
+        <div id="conflictCompareA" style="padding:20px;border-right:1px solid var(--border);overflow-y:auto;context-menu:url(#translateContextMenu)"></div>
+        
+        <!-- Entry B -->
+        <div id="conflictCompareB" style="padding:20px;overflow-y:auto;context-menu:url(#translateContextMenu)"></div>
+      </div>
+
+      <!-- Actions (bottom) with compact button layout -->
+      <div style="border-top:1px solid var(--border);padding:15px 20px;background:var(--surface2);display:flex;flex-wrap:wrap;gap:10px;justify-content:center" id="conflictCompareActions"></div>
+      
+      <!-- Resize handle (bottom-right corner) -->
+      <div style="position:absolute;bottom:0;right:0;width:20px;height:20px;cursor:se-resize;background:linear-gradient(135deg,transparent 0%,var(--border) 100%)" id="resizeHandle"></div>
     </div>
   </div>
 

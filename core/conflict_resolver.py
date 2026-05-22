@@ -128,7 +128,16 @@ class ConflictResolver:
             affected = [entry_a_id, entry_b_id, merged_entry["id"]]
 
         elif action == "dismiss":
-            affected = []
+            # Restore both entries to active — the conflict is ignored, not resolved
+            self._engine.update_status(
+                entry_a_id, "active",
+                reason=reason or "conflict dismissed -- conflict {}".format(conflict_id),
+            )
+            self._engine.update_status(
+                entry_b_id, "active",
+                reason=reason or "conflict dismissed -- conflict {}".format(conflict_id),
+            )
+            affected = [entry_a_id, entry_b_id]
 
         self._remove_conflict(conflict_id)
 

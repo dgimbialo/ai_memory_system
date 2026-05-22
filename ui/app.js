@@ -9,6 +9,7 @@ import { initConflicts }  from './conflicts.js';
 import { initSettings }   from './settings.js';
 import { initFileBrowser }from './filebrowser.js';
 import { initGraph }      from './graph.js';
+import { t, setLanguage, getLanguage } from './translations.js';
 
 // ── Global state ──────────────────────────────────────────────────────────────
 export const State = {
@@ -16,6 +17,8 @@ export const State = {
   projects:   [],     // [{name, entry_count}]
   activeTab:  'dashboard',
 };
+
+export { t };
 
 // ── API helper ────────────────────────────────────────────────────────────────
 export const API = {
@@ -37,10 +40,14 @@ export const API = {
   },
 
   async post(endpoint, body = {}) {
-    const res = await fetch(`${this._base}/${endpoint}`, {
+    // Extract project from body to send as query param (server reads project from qs)
+    const { project, ...restBody } = body;
+    let url = `${this._base}/${endpoint}`;
+    if (project) url += `?project=${encodeURIComponent(project)}`;
+    const res = await fetch(url, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify(body),
+      body:    JSON.stringify(restBody),
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: res.statusText }));
@@ -50,10 +57,14 @@ export const API = {
   },
 
   async patch(endpoint, body = {}) {
-    const res = await fetch(`${this._base}/${endpoint}`, {
+    // Extract project from body to send as query param (server reads project from qs)
+    const { project, ...restBody } = body;
+    let url = `${this._base}/${endpoint}`;
+    if (project) url += `?project=${encodeURIComponent(project)}`;
+    const res = await fetch(url, {
       method:  'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify(body),
+      body:    JSON.stringify(restBody),
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: res.statusText }));
@@ -220,4 +231,54 @@ document.addEventListener('DOMContentLoaded', async () => {
   updateConflictBadge();
   // Refresh badge every 60 s
   setInterval(updateConflictBadge, 60_000);
+
+  // Language selector
+  document.getElementById('langSelect').value = getLanguage();
+  document.getElementById('langSelect').addEventListener('change', e => {
+    setLanguage(e.target.value);
+    updateTranslations();
+    // Reinitialize all tabs to apply new language
+    tabInitialised.clear();
+    activateTab(State.activeTab);
+  });
+
+  // Apply initial translations
+  updateTranslations();
 });
+
+// ── Internationalization ──────────────────────────────────────────────────────
+export function updateTranslations() {
+  // Update elements with data-i18n attribute
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const key = el.dataset.i18n;
+    const text = t(key);
+    // Preserve nested elements if any
+    const hasNested = el.children.length > 0;
+    if (hasNested) {
+      el.textContent = text + ' ';
+      // Re-append children if they were removed
+      const nested = el.querySelectorAll('[class*="badge"]');
+      if (nested.length === 0 && el.dataset.tab === 'conflicts') {
+        const badge = document.createElement('span');
+        badge.className = 'badge';
+        badge.id = 'conflictBadge';
+        badge.style.display = 'none';
+        el.appendChild(badge);
+      }
+    } else {
+      el.textContent = text;
+    }
+  });
+
+  // Update elements with data-i18n-title attribute
+  document.querySelectorAll('[data-i18n-title]').forEach(el => {
+    const key = el.dataset.i18nTitle;
+    el.title = t(key);
+  });
+
+  // Update placeholders
+  document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
+    const key = el.dataset.i18nPlaceholder;
+    el.placeholder = t(key);
+  });
+}

@@ -1,5 +1,7 @@
 # AI Memory System
 
+![AI Memory System — Web Dashboard](docs/screenshot.png)
+
 A self-contained, **local** persistent memory engine for software projects, built for VS Code + GitHub Copilot Agent workflows.
 
 It **remembers decisions, tracks bugs and features, detects contradictions** between historical entries, renders a structured Markdown wiki, visualises dependency graphs, and automatically feeds that knowledge back into every Copilot Agent session via VS Code hooks so the agent always has full project context without any manual `#file` references.
@@ -35,16 +37,20 @@ One installation at `C:\ai_memory_system` serves **all** your projects — each 
 - **PostToolUse hook** — deterministically records a memory entry after every file write
 - **Append-first storage** — historical entries are never silently overwritten
 - **Atomic JSON writes** with automatic backup before overwrite
-- **Conflict detection + resolution** — semantic similarity + heuristics; `supersede`, `merge`, `dismiss` actions with full audit trail
-- **Revert detection** — identifies repeated revert patterns across entries
-- **Confidence decay** — time-based decay with preview mode
+- **Conflict detection + resolution** — semantic similarity + heuristics; `supersede`, `merge`, `dismiss` actions with full audit trail; hot-file discount suppresses false positives on frequently-edited files
+- **Orphan healing** — entries stuck in `conflict` status but with no matching conflict record are automatically restored to `active`
+- **Revert detection** — identifies repeated revert patterns; newly `unstable`-tagged entries receive a `×0.85` confidence penalty (floor `0.40`)
+- **Confidence decay** — time-based decay (configurable half-life) with preview mode; auto-scheduled once per day via the `add_memory` hook
 - **Semantic deduplication** — near-duplicate detection and merge with threshold control
 - **Dependency graph** — `depends_on` / `required_by` links; cycle detection; semantic link suggestions
+- **Auto-tagging** — keywords in `description`/`cause`/`fix` are matched against a configurable tag dictionary and applied automatically on `add_memory`
+- **Auto conflict scan** — `detect_conflicts()` runs automatically every 15 active entries
+- **Wiki dirty-check** — `render_wiki` is a no-op when no entries have changed since the last render
 - **Auto file summaries** — per-file digest regenerated on every `add_memory`
 - **Test-ID links** — attach test identifiers to entries; warns when superseded entries have linked tests
 - **Git stale check** — cross-checks entries against git history to flag outdated knowledge
 - **Markdown wiki** auto-rendered with Obsidian-friendly `[[wikilinks]]`: by type, file, status
-- **HTML dashboard** — local web UI with charts, vis.js dependency graph, settings form, operations panel
+- **HTML dashboard** — local web UI with charts, vis.js dependency graph, settings form, operations panel, i18n (EN/UK)
 - **Activity log** — every change timestamped with action and reason
 - **Learner** — analyses Copilot chat logs, extracts patterns, updates all managed project instructions
 - **Daemon** — background file watcher for non-agent edits (fallback)
@@ -166,7 +172,7 @@ python server.py --project my_app --port 8080 --no-browser
 | **Files** | File list with entry-count badges; click → auto-summary + entries |
 | **Settings** | Full settings form + Operations panel (decay, deduplication, render wiki, lint) |
 
-All tabs call the REST API at `/api/*` — every endpoint accepts `?project=NAME`.
+Language switcher (EN / UK) in the top-right corner — strings sourced from `ui/translations.js`.
 
 ---
 
@@ -247,9 +253,9 @@ ai_memory_system/
 │   ├── engine.py             # single gateway — all memory operations
 │   ├── storage.py            # atomic JSON I/O + backups
 │   ├── models.py             # MemoryEntry, ConflictRecord (depends_on, test_ids fields)
-│   ├── conflict.py           # conflict detection rules
+│   ├── conflict.py           # conflict detection rules + hot-file discount
 │   ├── conflict_resolver.py  # supersede / merge / dismiss actions
-│   ├── revert_detector.py    # revert pattern detection
+│   ├── revert_detector.py    # revert pattern detection + confidence penalty
 │   ├── decay.py              # time-based confidence decay
 │   ├── deduplicator.py       # near-duplicate detection and merge
 │   ├── dependency_graph.py   # depends_on graph — add/remove/query/suggest
@@ -275,7 +281,10 @@ ai_memory_system/
 │   ├── conflicts.js          # conflict cards + resolution actions
 │   ├── graph.js              # vis.js dependency graph
 │   ├── filebrowser.js        # file list + auto-summary view
-│   └── settings.js           # settings form + operations panel
+│   ├── settings.js           # settings form + operations panel
+│   └── translations.js       # EN/UK i18n strings
+├── docs/
+│   └── screenshot.png        # dashboard screenshot
 ├── data/                     # ← gitignored; created by bootstrap.py
 │   ├── .gitkeep
 │   └── projects/             # per-project isolated stores
@@ -391,19 +400,23 @@ engine.render_wiki_md()
 ### Ключові можливості (Key Features)
 
 - **SessionStart hook** — інжектує повну пам'ять проекту в кожну сесію GitHub Copilot Agent автоматично
-- **PostToolUse hook** — детерміністично записує запис пам'яти після кожного запису файлу
-- **Додаток-перший формат зберігання** — історичні записи ніколи не перезаписуються мовчки
+- **PostToolUse hook** — детерміністично записує запис пам'яті після кожного запису файлу
+- **Append-first storage** — історичні записи ніколи не перезаписуються мовчки
 - **Атомарні JSON записи** з автоматичним резервним копіюванням перед перезаписом
-- **Виявлення та розв'язання конфліктів** — семантична схожість + евристики; дії `supersede`, `merge`, `dismiss` з повною аудит-стежкою
-- **Виявлення повернень** — ідентифікує повторювані паттерни повернення між записами
-- **Розпад впевненості** — часовий розпад з режимом попереднього перегляду
-- **Семантична дедублікація** — виявлення та об'єднання майже-дублів з контролем порога
+- **Виявлення та розв'язання конфліктів** — семантична схожість + евристики; знижка для "гарячих" файлів (частих файлів); дії `supersede`, `merge`, `dismiss` з повною аудит-стежкою
+- **Зцілення сиріт** — записи зі статусом `conflict` без відповідного запису конфлікту автоматично відновлюються до `active`
+- **Виявлення повернень** — ідентифікує повторювані паттерни; новоозначені `unstable` записи отримують штраф `×0.85` до впевненості (мінімум `0.40`)
+- **Розпад впевненості** — часовий розпад з режимом попереднього перегляду; автоматичне планування раз на день через хук `add_memory`
+- **Семантична дедублікація** — виявлення та об'єднання майже-дублів з контролем порогу
+- **Автоматичне тегування** — ключові слова з `description`/`cause`/`fix` зіставляються зі словником тегів і застосовуються автоматично
+- **Авто-сканування конфліктів** — `detect_conflicts()` запускається автоматично кожні 15 активних записів
+- **Перевірка оновленості вікі** — `render_wiki` пропускається, якщо з часу останнього рендеру нічого не змінилось
 - **Граф залежностей** — посилання `depends_on` / `required_by`; виявлення циклів; пропозиції семантичних посилань
-- **Автоматичні резюме файлів** — резюме для кожного файлу, перегенеровано при кожному `add_memory`
-- **Посилання на ідентифікатори тестів** — прикріпити ідентифікатори тестів до записів; попередження коли заміщені записи мають пов'язані тести
+- **Автоматичні резюме файлів** — резюме для кожного файлу, перегенероване при кожному `add_memory`
+- **Посилання на ідентифікатори тестів** — прикріпити ідентифікатори тестів до записів; попередження при заміщенні
 - **Перевірка застарілості Git** — крос-перевірка записів з історією git для позначення застарілих знань
-- **Вікі Markdown** — автоматично відтворена з Obsidian-friendly `[[wikilinks]]`: по типу, файлу, статусу
-- **HTML дашбоард** — локальний веб-інтерфейс з діаграмами, графом залежностей vis.js, формою параметрів, панеллю операцій
+- **Вікі Markdown** — автоматично відтворена з Obsidian-friendly `[[wikilinks]]`
+- **HTML дашбоард** — локальний веб-інтерфейс з діаграмами, графом залежностей vis.js, формою параметрів, панеллю операцій, підтримкою EN/UK
 - **Журнал діяльності** — кожна зміна з часовою міткою, дією та причиною
 - **Учень** — аналізує журнали чату Copilot, розпізнає паттерни, оновлює інструкції всіх керованих проектів
 - **Демон** — фоновий спостерігач файлів для редагувань не агентом (резервний варіант)
