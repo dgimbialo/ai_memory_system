@@ -1,5 +1,9 @@
 # AI Memory System
 
+A self-contained, local persistent memory engine for software projects, built for VS Code + GitHub Copilot Agent workflows.
+
+It remembers decisions, tracks bugs and features, detects contradictions between historical entries, renders a structured Markdown wiki, visualises dependency graphs, and automatically feeds that knowledge back into every Copilot Agent session via VS Code hooks so the agent always has full project context without any manual #file references.
+
 ## Why does this exist?
 
 AI agents start every new chat session with a **blank slate** — no memory of decisions made before, bugs already fixed, or why the code looks the way it does. When tackling a new problem, they routinely break solutions that were carefully built in previous sessions.
@@ -16,10 +20,6 @@ AI agents start every new chat session with a **blank slate** — no memory of d
 ---
 
 ![AI Memory System — Web Dashboard](docs/screenshot.png)
-
-A self-contained, **local** persistent memory engine for software projects, built for VS Code + GitHub Copilot Agent workflows.
-
-It **remembers decisions, tracks bugs and features, detects contradictions** between historical entries, renders a structured Markdown wiki, visualises dependency graphs, and automatically feeds that knowledge back into every Copilot Agent session via VS Code hooks so the agent always has full project context without any manual `#file` references.
 
 ---
 
