@@ -1,7 +1,19 @@
 # AI Memory System
 
-> **Why does this exist?**
-> Every new AI chat session starts with a blank slate — the agent has no idea what decisions were made yesterday, which bugs were already fixed, or why the code looks the way it does. Worse, when solving a new problem the agent often breaks solutions that were carefully crafted before. This system was built to fix that. It stores not just *what* changed in each file, but *why* — what problem was being solved, how it was resolved, and how that change relates to everything else. Every edit is linked to its cause and effect, contradictions between past and present decisions are detected automatically, and all of that context is fed back into every new agent session — so the AI always knows the full history of your project.
+## Why does this exist?
+
+AI agents start every new chat session with a **blank slate** — no memory of decisions made before, bugs already fixed, or why the code looks the way it does. When tackling a new problem, they routinely break solutions that were carefully built in previous sessions.
+
+**AI Memory System** was created to solve exactly that:
+
+| Problem | Solution |
+|---|---|
+| Every new chat forgets everything | Full project memory is injected into every new agent session automatically |
+| Agents break existing solutions | Each change is stored with cause, fix, and links to related changes — agents see the full picture |
+| Git log only shows *what* changed | The system records *why* it changed, *what problem* it solved, and *how it connects* to other decisions |
+| Contradictions go unnoticed | Past and present changes are compared; conflicts are detected and surfaced for resolution |
+
+---
 
 ![AI Memory System — Web Dashboard](docs/screenshot.png)
 
@@ -399,6 +411,20 @@ engine.render_wiki_md()
 ### Огляд (Overview)
 
 **AI Memory System** — локальний рушій персистентної пам'яті для програмних проектів. Система запам'ятовує рішення, отримує записи про помилки та функції, виявляє суперечності та автоматично надає повний контекст проекту кожній сесії GitHub Copilot Agent в VS Code.
+---
+## Навіщо це потрібно?
+
+AI-агенти починають кожну нову сесію з **чистого аркуша** — без жодної пам'яті про попередні рішення, виправлені баги чи причини, чому код виглядає саме так. Вирішуючи нову задачу, агенти регулярно ламають рішення, які були ретельно побудовані в попередніх сесіях.
+
+**AI Memory System** була створена саме для того, щоб це виправити:
+
+| Проблема | Рішення |
+|---|---|
+| Кожен новий чат все забуває | Повна пам'ять проєкту автоматично вставляється в кожну нову сесію агента |
+| Агенти ламають існуючі рішення | Кожна зміна зберігається з причиною, виправленням та зв'язками з іншими змінами |
+| Git log показує лише *що* змінилось | Система зберігає *чому* змінилось, *яку проблему* вирішувало і *як пов'язане* з іншими рішеннями |
+| Суперечності між змінами залишаються непоміченими | Минулі та поточні зміни порівнюються; конфлікти виявляються і виводяться для вирішення |
+---
 
 ### Ключові можливості (Key Features)
 
