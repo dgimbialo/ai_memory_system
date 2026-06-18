@@ -30,12 +30,15 @@ REST API:
 from __future__ import annotations
 
 import argparse
+import collections
 import json
+import queue as _queue
 import sys
 import threading
+import time as _time
 import webbrowser
 from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path, PurePath
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -105,7 +108,10 @@ import collections, time as _time  # noqa: E402  (stdlib, always available)
 _LOG_MAXLEN = 500           # keep last 500 events in memory
 _log_ring: collections.deque = collections.deque(maxlen=_LOG_MAXLEN)
 _log_lock = threading.Lock()
-_sse_clients: list = []      # list of queue.Queue, one per open SSE connection
+_sse_clients: list = []      # list of (queue.Queue, client_id), one per open SSE connection
+_sse_max_clients = 20        # max concurrent SSE connections to prevent resource exhaustion
+_sse_client_counter = 0
+_sse_client_lock = threading.Lock()
 
 import queue as _queue       # noqa: E402
 
@@ -126,17 +132,21 @@ def _audit(source: str, method: str, path: str, body: dict,
     data = json.dumps(event, ensure_ascii=False, default=str)
     with _log_lock:
         _log_ring.append(event)
-        dead = []
-        for q in _sse_clients:
+
+    # Fan-out to SSE clients with proper locking
+    with _sse_client_lock:
+        dead_ids = []
+        for q, client_id in list(_sse_clients):
             try:
                 q.put_nowait(data)
             except _queue.Full:
-                dead.append(q)
-        for q in dead:
-            try:
-                _sse_clients.remove(q)
-            except ValueError:
-                pass
+                dead_ids.append(client_id)  # queue full = client too slow, drop
+            except Exception:
+                dead_ids.append(client_id)
+
+        # Clean up dead clients
+        if dead_ids:
+            _sse_clients[:] = [(q, cid) for q, cid in _sse_clients if cid not in dead_ids]
 
 # ---------------------------------------------------------------------------
 # Project helpers (mirror logic from run.py)
@@ -210,6 +220,18 @@ class MemoryHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # suppress default access log
         pass
 
+    def log_error(self, fmt, *args):  # don't dump tracebacks for dropped clients
+        pass
+
+    def handle(self):
+        # Wrap the keep-alive request loop so a client that disconnects
+        # mid-stream (browser tab closed, Tracking Prevention, reload) never
+        # bubbles a ConnectionAbortedError traceback up to stderr.
+        try:
+            super().handle()
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            pass
+
     # ── HTTP verbs ─────────────────────────────────────────────────────────
 
     def do_OPTIONS(self):
@@ -244,6 +266,7 @@ class MemoryHandler(BaseHTTPRequestHandler):
     def _dispatch_api(self, method: str, path: str, qs: dict, body: dict):
         _t0 = _time.perf_counter()
         _status_holder = [200]
+        self._client_gone = False
         _orig_json = self._json  # patch to capture status
 
         def _tracked_json(data, status=200):
@@ -319,8 +342,11 @@ class MemoryHandler(BaseHTTPRequestHandler):
                 else:
                     self._error("Not found", 404)
 
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            self._client_gone = True  # client vanished; don't try to respond
         except Exception as exc:
-            self._error(f"Internal error: {exc}", 500)
+            if not getattr(self, "_client_gone", False):
+                self._error(f"Internal error: {exc}", 500)
         finally:
             self._json = _orig_json  # always restore
             _audit("http", method, path,
@@ -586,19 +612,39 @@ class MemoryHandler(BaseHTTPRequestHandler):
         Sends the current ring-buffer snapshot on connect, then fans out every
         new event. Stays open until the client disconnects (broken pipe).
         Each event is: ``data: <json>\\n\\n``.
-        """
-        q: _queue.Queue = _queue.Queue(maxsize=200)
 
-        # Send current snapshot first
+        Multiple concurrent clients are supported with a max limit to prevent
+        resource exhaustion.
+        """
+        global _sse_client_counter
+
+        # Check if we're at capacity
+        with _sse_client_lock:
+            if len(_sse_clients) >= _sse_max_clients:
+                self.send_response(503)  # Service Unavailable
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Retry-After", "30")
+                self.end_headers()
+                self.wfile.write(b"Too many concurrent log streams. Try again later.")
+                return
+
+            # Allocate a new client ID and queue
+            _sse_client_counter += 1
+            client_id = _sse_client_counter
+            q: _queue.Queue = _queue.Queue(maxsize=200)
+            _sse_clients.append((q, client_id))
+
+        # Get current snapshot (doesn't need client lock)
         with _log_lock:
             snapshot = list(_log_ring)
-            _sse_clients.append(q)
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "keep-alive")
         self.end_headers()
+
         try:
             # Replay history to the new subscriber
             for event in snapshot:
@@ -606,24 +652,23 @@ class MemoryHandler(BaseHTTPRequestHandler):
                                                    default=str) + "\n\n").encode("utf-8")
                 self.wfile.write(payload)
             self.wfile.flush()
+
             # Stream live events
             while True:
                 try:
-                    data = q.get(timeout=20)
+                    data = q.get(timeout=25)  # increased timeout
                     self.wfile.write(("data: " + data + "\n\n").encode("utf-8"))
                     self.wfile.flush()
                 except _queue.Empty:
                     # Keepalive comment to prevent proxy timeouts
                     self.wfile.write(b": keepalive\n\n")
                     self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            pass
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            pass  # Client disconnected
         finally:
-            with _log_lock:
-                try:
-                    _sse_clients.remove(q)
-                except ValueError:
-                    pass
+            # Clean up this client
+            with _sse_client_lock:
+                _sse_clients[:] = [(q_, cid) for q_, cid in _sse_clients if cid != client_id]
 
     def _serve_static(self, path: str):
         if path in ("/", ""):
@@ -631,22 +676,25 @@ class MemoryHandler(BaseHTTPRequestHandler):
         rel = unquote(path).lstrip("/")
         target = (UI_DIR / rel).resolve()
         try:
-            target.relative_to(UI_DIR.resolve())
-        except ValueError:
-            self.send_response(403)
+            try:
+                target.relative_to(UI_DIR.resolve())
+            except ValueError:
+                self.send_response(403)
+                self.end_headers()
+                return
+            if not target.is_file():
+                self.send_response(404)
+                self.end_headers()
+                return
+            body = target.read_bytes()
+            ct = CONTENT_TYPES.get(target.suffix.lower(), "application/octet-stream")
+            self.send_response(200)
+            self.send_header("Content-Type", ct)
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            return
-        if not target.is_file():
-            self.send_response(404)
-            self.end_headers()
-            return
-        body = target.read_bytes()
-        ct = CONTENT_TYPES.get(target.suffix.lower(), "application/octet-stream")
-        self.send_response(200)
-        self.send_header("Content-Type", ct)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+            self.wfile.write(body)
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            self._client_gone = True
 
     # ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -659,11 +707,16 @@ class MemoryHandler(BaseHTTPRequestHandler):
 
     def _json(self, data, status: int = 200):
         body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            # Client closed the tab / aborted the request mid-response.
+            # Nothing left to send to — drop quietly instead of a traceback.
+            self._client_gone = True
 
     def _error(self, msg: str, status: int = 400):
         self._json({"error": msg}, status)
@@ -689,6 +742,14 @@ def make_handler(project: str | None):
     return BoundHandler
 
 
+class DashboardServer(ThreadingHTTPServer):
+    # allow_reuse_address=False so a second launch fails fast on Windows instead
+    # of silently co-binding to the same port (which routes requests
+    # nondeterministically between processes — the classic "unstable server").
+    allow_reuse_address = False
+    daemon_threads = True
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="AI Memory System — local HTML dashboard server",
@@ -701,8 +762,20 @@ def main():
                         help="Do not open browser automatically")
     args = parser.parse_args()
 
-    server = HTTPServer(("127.0.0.1", args.port), make_handler(args.project))
     url = f"http://localhost:{args.port}"
+
+    # Single-instance guard: if the port is already taken, assume a dashboard is
+    # already running and just point the user at it (don't spawn a duplicate).
+    try:
+        server = DashboardServer(("127.0.0.1", args.port), make_handler(args.project))
+    except OSError as exc:
+        # WinError 10048 / errno 98 / 48 — address already in use.
+        print(f"  A dashboard is already running on {url} (port in use).")
+        print(f"  Open {url} in your browser, or stop the other instance first.")
+        if not args.no_browser:
+            webbrowser.open(url)
+        sys.exit(0)
+
     print(f"  AI Memory System  →  {url}")
     if args.project:
         print(f"  Default project   →  {args.project}")
@@ -714,7 +787,9 @@ def main():
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("Server stopped.")
+        print("\nServer stopped.")
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":

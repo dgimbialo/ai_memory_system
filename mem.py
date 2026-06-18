@@ -238,18 +238,43 @@ def cmd_wiki(args):
     return _run(["render_wiki"])
 
 
+def _port_in_use(port: int) -> bool:
+    """True if something is already listening on 127.0.0.1:<port>."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.3)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
 def cmd_ui(args):
     """Start the local web dashboard and open it in a browser."""
-    import threading, time
-    p = str(args.port)
+    import time
+    port = args.port
+    p = str(port)
+    url = f"http://127.0.0.1:{p}"
+
+    # Single-instance guard: don't spawn a duplicate server. Repeated /memui
+    # calls used to pile up multiple processes all bound to the same port,
+    # which routed requests nondeterministically and looked like crashes.
+    if _port_in_use(port):
+        print(f"Dashboard already running on {url} — opening browser.")
+        webbrowser.open(url)
+        return 0
+
     proj = _resolve_project()
     server_args = [PYTHON, str(ROOT / "server.py"), "--port", p, "--no-browser"]
     if proj:
         server_args += ["--project", proj]
-    print(f"Starting memory dashboard on http://127.0.0.1:{p} …")
+    print(f"Starting memory dashboard on {url} …")
     proc = subprocess.Popen(server_args)
-    time.sleep(1.2)
-    webbrowser.open(f"http://127.0.0.1:{p}")
+
+    # Wait until it actually accepts connections (up to ~5s) before opening
+    # the browser, so the first page load doesn't race the bind.
+    for _ in range(25):
+        if _port_in_use(port):
+            break
+        time.sleep(0.2)
+    webbrowser.open(url)
     print("Press Ctrl+C to stop the server.")
     try:
         proc.wait()
