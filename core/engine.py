@@ -476,6 +476,66 @@ class MemoryEngine:
             "skipped_too_recent": still_unstable,
         }
 
+    def recompute_unstable(self, dry_run: bool = False) -> Dict[str, Any]:
+        """Re-evaluate every 'unstable' tag with the current RevertDetector.
+
+        Earlier versions of the detector flagged any two entries sharing a hot
+        *file* whose text happened to contain add/revert words, which tagged a
+        majority of the store as unstable. This pass replays detection over the
+        full history with the precision-fixed detector (function-level surface,
+        description/cause classification, hotspot guard) and removes the
+        'unstable' tag from entries that no longer qualify.
+
+        Confidence is *not* restored automatically (the original pre-penalty
+        value isn't recoverable); only the misleading tag is cleared.
+
+        Returns dict: dry_run, total_unstable_before, kept, cleared (ids), reason.
+        """
+        from .revert_detector import RevertDetector
+
+        memory = self._read_memory()
+        detector = RevertDetector(self)
+
+        # An entry legitimately stays unstable if replaying detection with it as
+        # the "new" entry against the rest still yields a warning naming it.
+        still_unstable: set = set()
+        for e in memory:
+            if "unstable" not in (e.get("tags") or []):
+                continue
+            warning = detector.check(e, memory, apply_tags=False)
+            if warning is not None:
+                still_unstable.add(e["id"])
+                for rid in warning.related_entry_ids:
+                    still_unstable.add(rid)
+
+        cleared: List[str] = []
+        before = 0
+        for e in memory:
+            if "unstable" not in (e.get("tags") or []):
+                continue
+            before += 1
+            if e["id"] not in still_unstable:
+                cleared.append(e["id"])
+                if not dry_run:
+                    e["tags"] = [t for t in e["tags"] if t != "unstable"]
+
+        if not dry_run and cleared:
+            self.storage.write(MEMORY_FILE, memory)
+            self._log(
+                "recompute_unstable",
+                cleared,
+                "cleared stale 'unstable' tag from {} entries "
+                "(precision-fixed detector)".format(len(cleared)),
+            )
+
+        return {
+            "dry_run":               dry_run,
+            "total_unstable_before": before,
+            "kept":                  before - len(cleared),
+            "cleared":               cleared,
+            "reason":                "re-evaluated with precision-fixed RevertDetector",
+        }
+
     # ---------- file summaries ----------
 
     def _update_file_summaries(self, files: List[str]) -> None:
@@ -657,7 +717,8 @@ class MemoryEngine:
             # Weight: 90% semantic + 10% decayed confidence — keeps relevance dominant.
             conf_factor = _eff_conf(
                 original=float(e.get("confidence") or 0.5),
-                timestamp=e.get("timestamp") or "",
+                # Reuse resets the decay clock: rank by freshness of last_used too.
+                timestamp=(e.get("last_used") or e.get("timestamp") or ""),
                 now=_now,
             )
             score = sem_score * 0.9 + conf_factor * 0.1
@@ -748,6 +809,81 @@ class MemoryEngine:
         self.storage.write(MEMORY_FILE, memory)
         self._log("update_confidence", [entry_id], reason or f"confidence -> {confidence}")
         return updated
+
+    # ---------- reinforcement (the missing feedback loop) ----------
+
+    _REINFORCE_DELTA: float = 0.1
+    _REINFORCE_CAP: float = 0.97
+    _WEAKEN_DELTA: float = 0.15
+    _CONF_FLOOR: float = 0.25
+
+    def reinforce(
+        self, entry_id: str, delta: Optional[float] = None, reason: str = ""
+    ) -> Dict[str, Any]:
+        """Confirm a memory: bump confidence, count the use, reset the decay clock.
+
+        This is the feedback loop the store previously lacked — confidence could
+        only ever fall (decay / unstable penalty). Call when an entry proved
+        correct or was reused successfully.
+        """
+        from datetime import datetime, timezone as _tz
+        d = self._REINFORCE_DELTA if delta is None else float(delta)
+        memory = self._read_memory()
+        now_iso = datetime.now(_tz.utc).isoformat()
+        found = None
+        for e in memory:
+            if e.get("id") == entry_id:
+                old = float(e.get("confidence") or 0.5)
+                e["confidence"] = round(min(self._REINFORCE_CAP, old + d), 4)
+                e["usage_count"] = int(e.get("usage_count") or 0) + 1
+                e["last_used"] = now_iso
+                found = {"id": entry_id, "old": old, "new": e["confidence"],
+                         "usage_count": e["usage_count"]}
+                break
+        if found is None:
+            raise KeyError(f"entry not found: {entry_id}")
+        self.storage.write(MEMORY_FILE, memory)
+        self._log("reinforce", [entry_id],
+                  reason or f"reinforced {found['old']} -> {found['new']}")
+        return found
+
+    def weaken(
+        self, entry_id: str, delta: Optional[float] = None, reason: str = ""
+    ) -> Dict[str, Any]:
+        """Reject a memory: lower confidence toward the floor (it misled you)."""
+        d = self._WEAKEN_DELTA if delta is None else float(delta)
+        memory = self._read_memory()
+        found = None
+        for e in memory:
+            if e.get("id") == entry_id:
+                old = float(e.get("confidence") or 0.5)
+                e["confidence"] = round(max(self._CONF_FLOOR, old - d), 4)
+                found = {"id": entry_id, "old": old, "new": e["confidence"]}
+                break
+        if found is None:
+            raise KeyError(f"entry not found: {entry_id}")
+        self.storage.write(MEMORY_FILE, memory)
+        self._log("weaken", [entry_id],
+                  reason or f"weakened {found['old']} -> {found['new']}")
+        return found
+
+    def touch_used(self, entry_ids: List[str]) -> int:
+        """Mark entries as just-recalled: reset decay clock without changing
+        confidence. Called when query_memory surfaces an entry to the agent."""
+        if not entry_ids:
+            return 0
+        from datetime import datetime, timezone as _tz
+        ids = set(entry_ids)
+        now_iso = datetime.now(_tz.utc).isoformat()
+        memory = self._read_memory()
+        n = 0
+        for e in memory:
+            if e.get("id") in ids:
+                e["last_used"] = now_iso
+                n += 1
+        if n:
+            self.storage.write(MEMORY_FILE, memory)
+        return n
 
     # ---------- dependency graph ----------
 

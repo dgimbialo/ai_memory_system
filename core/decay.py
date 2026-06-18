@@ -45,7 +45,11 @@ if TYPE_CHECKING:
 
 # Default decay parameters
 HALF_LIFE_DAYS: float = 60.0
-MIN_CONFIDENCE: float = 0.40
+# Decay floor. Kept *below* the birth confidence (0.5) so that a stale entry can
+# actually decay and a reinforced entry can actually stand out — previously the
+# floor (0.40) equalled the default birth value, which pinned 93% of real
+# entries at one number and made confidence carry no information.
+MIN_CONFIDENCE: float = 0.25
 
 # Statuses exempt from decay (they are already terminal)
 _EXEMPT_STATUS = {"superseded", "resolved"}
@@ -214,7 +218,7 @@ class DecayEngine:
     def _eff(self, entry: Dict[str, Any], now: datetime) -> float:
         return effective_confidence(
             original=float(entry.get("confidence") or 0.5),
-            timestamp=entry.get("timestamp") or "",
+            timestamp=_anchor_ts(entry),
             half_life_days=self.half_life_days,
             min_confidence=self.min_confidence,
             now=now,
@@ -223,9 +227,23 @@ class DecayEngine:
     @staticmethod
     def _age_days(entry: Dict[str, Any], now: datetime) -> float:
         try:
-            ts = datetime.fromisoformat(entry.get("timestamp") or "")
+            ts = datetime.fromisoformat(_anchor_ts(entry))
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
             return (now - ts).total_seconds() / 86400.0
         except (ValueError, TypeError):
             return 0.0
+
+
+def _anchor_ts(entry: Dict[str, Any]) -> str:
+    """Decay clock anchor: the freshest of last_used and timestamp.
+
+    Reusing a memory (recalled and acted upon) resets its decay clock, so a
+    repeatedly-useful entry stays confident even if it was first written long
+    ago. Falls back to the write timestamp when the entry was never reused.
+    """
+    last_used = entry.get("last_used") or ""
+    timestamp = entry.get("timestamp") or ""
+    if last_used and timestamp:
+        return max(last_used, timestamp)  # ISO-8601 sorts lexicographically
+    return last_used or timestamp

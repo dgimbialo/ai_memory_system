@@ -39,3 +39,7 @@ data/projects/
 # OS
 .DS_Store
 Thumbs.db
+
+*.sublime-workspace
+*.log
+

@@ -227,6 +227,69 @@ class TestRevertDetectorWarning:
         assert "WARNING" in result.message
 
 
+class TestPrecisionGuards:
+    """Regression guards for the precision fix (function surface + hotspot)."""
+
+    def test_same_file_different_functions_no_warning(self, tmp_path):
+        """Add/revert keywords on a SHARED FILE but DIFFERENT functions must not
+        warn — this was the dominant false-positive on real data (hot files)."""
+        engine = _make_engine(str(tmp_path))
+        f = ["ScoreNoteInserter.cpp"]
+        entries = [
+            {"id": "p1", "description": "add synchronous paint", "cause": "",
+             "fix": "", "functions": ["PaintNotes"], "files": f,
+             "status": "active", "tags": []},
+            {"id": "p2", "description": "remove redundant call", "cause": "",
+             "fix": "", "functions": ["LinkNotes"], "files": f,
+             "status": "active", "tags": []},
+            {"id": "p3", "description": "add bar boundary handling", "cause": "",
+             "fix": "", "functions": ["OnBarBoundary"], "files": f,
+             "status": "active", "tags": []},
+        ]
+        new_entry = {"id": "p4", "description": "revert grace note tweak",
+                     "cause": "", "fix": "", "functions": ["CompleteNote"],
+                     "files": f, "status": "active", "tags": []}
+        result = RevertDetector(engine).check(new_entry, entries + [new_entry])
+        assert result is None
+
+    def test_revert_word_only_in_fix_no_warning(self, tmp_path):
+        """Revert/add words appearing ONLY in the fix mechanism (not the intent
+        description) must not classify an entry as churn."""
+        engine = _make_engine(str(tmp_path))
+        fn = ["SharedFunc"]
+        entries = [
+            {"id": "q1", "description": "improve quantization accuracy",
+             "cause": "", "fix": "added a clamp and removed the old branch",
+             "functions": fn, "files": [], "status": "active", "tags": []},
+            {"id": "q2", "description": "tune phase offset",
+             "cause": "", "fix": "removed dead code, added guard",
+             "functions": fn, "files": [], "status": "active", "tags": []},
+        ]
+        new_entry = {"id": "q3", "description": "adjust note linking",
+                     "cause": "", "fix": "removed redundant call; added log",
+                     "functions": fn, "files": [], "status": "active", "tags": []}
+        # None of the descriptions carry add/revert intent → no classification
+        result = RevertDetector(engine).check(new_entry, entries + [new_entry])
+        assert result is None
+
+    def test_apply_tags_false_has_no_side_effect(self, tmp_path):
+        """check(apply_tags=False) must never mutate the store."""
+        engine = _make_engine(str(tmp_path))
+        fn = ["ChurnFunc"]
+        for desc, fx in [("add churn", "implement"), ("revert churn", "remove"),
+                         ("re-add churn", "enable"), ("revert churn v2", "disable")]:
+            engine.add_memory({"type": "bug_fix", "description": desc, "cause": "",
+                               "fix": fx, "files": [], "functions": fn,
+                               "confidence": 0.9, "tags": []})
+        before = json.dumps(engine._read_memory(), sort_keys=True)
+        new = {"id": "zz", "description": "revert churn v3", "cause": "",
+               "fix": "disable", "functions": fn, "files": [], "status": "active",
+               "tags": []}
+        RevertDetector(engine).check(new, engine._read_memory() + [new], apply_tags=False)
+        after = json.dumps(engine._read_memory(), sort_keys=True)
+        assert before == after
+
+
 class TestFileBasedDetection:
     def test_file_surface_triggers_warning(self, tmp_path):
         """Detection also works on shared files when no functions overlap."""

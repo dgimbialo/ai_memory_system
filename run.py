@@ -243,6 +243,22 @@ def cmd_stabilize_unstable(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reinforce(args: argparse.Namespace) -> int:
+    _print(_engine(args.project).reinforce(args.id, delta=args.delta, reason=args.reason or ""))
+    return 0
+
+
+def cmd_weaken(args: argparse.Namespace) -> int:
+    _print(_engine(args.project).weaken(args.id, delta=args.delta, reason=args.reason or ""))
+    return 0
+
+
+def cmd_recompute_unstable(args: argparse.Namespace) -> int:
+    result = _engine(args.project).recompute_unstable(dry_run=args.dry_run)
+    _print(result)
+    return 0
+
+
 def cmd_update_instructions(args: argparse.Namespace) -> int:
     result = _engine(args.project).update_instructions(
         project_path=args.project_path,
@@ -526,6 +542,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write changes to disk (default when --dry-run is omitted)",
     )
     su.set_defaults(func=cmd_stabilize_unstable)
+
+    ru = sub.add_parser(
+        "recompute_unstable",
+        help="Re-evaluate all 'unstable' tags with the precision-fixed detector and clear stale ones",
+    )
+    ru.add_argument(
+        "--dry-run", dest="dry_run", action="store_true", default=False,
+        help="Show which tags would be cleared without writing to disk",
+    )
+    ru.add_argument(
+        "--apply", dest="dry_run", action="store_false",
+        help="Write changes to disk (default when --dry-run is omitted)",
+    )
+    ru.set_defaults(func=cmd_recompute_unstable)
+
+    rf = sub.add_parser("reinforce", help="Confirm a memory: raise confidence, count use, reset decay clock")
+    rf.add_argument("id", help="Entry id to reinforce")
+    rf.add_argument("--delta", type=float, default=None, help="Confidence increase (default 0.1)")
+    rf.add_argument("--reason", default=None)
+    rf.set_defaults(func=cmd_reinforce)
+
+    wk = sub.add_parser("weaken", help="Reject a memory: lower confidence toward the floor")
+    wk.add_argument("id", help="Entry id to weaken")
+    wk.add_argument("--delta", type=float, default=None, help="Confidence decrease (default 0.15)")
+    wk.add_argument("--reason", default=None)
+    wk.set_defaults(func=cmd_weaken)
 
     return p
 

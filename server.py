@@ -42,6 +42,13 @@ from urllib.parse import parse_qs, unquote, urlparse
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
+# Force UTF-8 on Windows consoles (avoids cp1252 crash on → ✅ ⚠ etc.)
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+    except (AttributeError, ValueError):
+        pass
+
 UI_DIR = ROOT / "ui"
 DATA_DIR = ROOT / "data"
 SETTINGS_FILE = "settings.json"
@@ -88,6 +95,48 @@ CONTENT_TYPES: dict = {
     ".svg":  "image/svg+xml",
     ".woff2": "font/woff2",
 }
+
+# ---------------------------------------------------------------------------
+# Request audit log — ring buffer + SSE fan-out
+# ---------------------------------------------------------------------------
+
+import collections, time as _time  # noqa: E402  (stdlib, always available)
+
+_LOG_MAXLEN = 500           # keep last 500 events in memory
+_log_ring: collections.deque = collections.deque(maxlen=_LOG_MAXLEN)
+_log_lock = threading.Lock()
+_sse_clients: list = []      # list of queue.Queue, one per open SSE connection
+
+import queue as _queue       # noqa: E402
+
+
+def _audit(source: str, method: str, path: str, body: dict,
+           status: int, duration_ms: float, project: str | None = None) -> None:
+    """Append one event to the ring buffer and fan-out to SSE subscribers."""
+    event = {
+        "ts":          datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        "source":      source,         # "http" | "mcp" | "cli"
+        "method":      method,
+        "path":        path,
+        "project":     project or "",
+        "body":        body,
+        "status":      status,
+        "duration_ms": round(duration_ms, 1),
+    }
+    data = json.dumps(event, ensure_ascii=False, default=str)
+    with _log_lock:
+        _log_ring.append(event)
+        dead = []
+        for q in _sse_clients:
+            try:
+                q.put_nowait(data)
+            except _queue.Full:
+                dead.append(q)
+        for q in dead:
+            try:
+                _sse_clients.remove(q)
+            except ValueError:
+                pass
 
 # ---------------------------------------------------------------------------
 # Project helpers (mirror logic from run.py)
@@ -193,9 +242,36 @@ class MemoryHandler(BaseHTTPRequestHandler):
     # ── router ─────────────────────────────────────────────────────────────
 
     def _dispatch_api(self, method: str, path: str, qs: dict, body: dict):
+        _t0 = _time.perf_counter()
+        _status_holder = [200]
+        _orig_json = self._json  # patch to capture status
+
+        def _tracked_json(data, status=200):
+            _status_holder[0] = status
+            _orig_json(data, status)
+
+        self._json = _tracked_json  # type: ignore[method-assign]
+
         try:
             project = self._project(qs)
             seg = [s for s in path.split("/") if s]  # ['api', cmd, ...]
+
+            # SSE stream endpoint — handle before the normal API routing
+            if method == "GET" and path == "/api/log/stream":
+                self._json = _orig_json  # restore before streaming
+                self._sse_log_stream()
+                _audit("http", method, path, {}, 200,
+                       (_time.perf_counter() - _t0) * 1000, project)
+                return
+
+            # Log snapshot endpoint
+            if method == "GET" and path == "/api/log/entries":
+                with _log_lock:
+                    snapshot = list(_log_ring)
+                self._json(snapshot[-int(self._qs1(qs, "limit", "200")):])
+                _audit("http", method, path, {}, _status_holder[0],
+                       (_time.perf_counter() - _t0) * 1000, project)
+                return
 
             if method == "GET":
                 if path == "/api/projects":
@@ -245,6 +321,13 @@ class MemoryHandler(BaseHTTPRequestHandler):
 
         except Exception as exc:
             self._error(f"Internal error: {exc}", 500)
+        finally:
+            self._json = _orig_json  # always restore
+            _audit("http", method, path,
+                   {k: v for k, v in body.items() if k != "password"} if body else {},
+                   _status_holder[0],
+                   (_time.perf_counter() - _t0) * 1000,
+                   self._project(qs))
 
     # ── API handlers ────────────────────────────────────────────────────────
 
@@ -496,6 +579,51 @@ class MemoryHandler(BaseHTTPRequestHandler):
         self._json(result)
 
     # ── Static file serving ─────────────────────────────────────────────────
+
+    def _sse_log_stream(self) -> None:
+        """Server-Sent Events stream for the real-time log tab.
+
+        Sends the current ring-buffer snapshot on connect, then fans out every
+        new event. Stays open until the client disconnects (broken pipe).
+        Each event is: ``data: <json>\\n\\n``.
+        """
+        q: _queue.Queue = _queue.Queue(maxsize=200)
+
+        # Send current snapshot first
+        with _log_lock:
+            snapshot = list(_log_ring)
+            _sse_clients.append(q)
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        try:
+            # Replay history to the new subscriber
+            for event in snapshot:
+                payload = ("data: " + json.dumps(event, ensure_ascii=False,
+                                                   default=str) + "\n\n").encode("utf-8")
+                self.wfile.write(payload)
+            self.wfile.flush()
+            # Stream live events
+            while True:
+                try:
+                    data = q.get(timeout=20)
+                    self.wfile.write(("data: " + data + "\n\n").encode("utf-8"))
+                    self.wfile.flush()
+                except _queue.Empty:
+                    # Keepalive comment to prevent proxy timeouts
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            with _log_lock:
+                try:
+                    _sse_clients.remove(q)
+                except ValueError:
+                    pass
 
     def _serve_static(self, path: str):
         if path in ("/", ""):

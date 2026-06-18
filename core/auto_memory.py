@@ -255,7 +255,10 @@ class AutoMemory:
             "fix": diff_summary,
             "files": [rel_file],
             "status": "active",
-            "confidence": 0.6 if prompt else 0.4,
+            # Birth confidence sits above the decay floor (0.25) so freshness and
+            # later reinforcement are both expressible. A change tied to an
+            # explicit user prompt starts higher than an inferred file change.
+            "confidence": 0.65 if prompt else 0.5,
             "tags": ["auto"],
         }
 

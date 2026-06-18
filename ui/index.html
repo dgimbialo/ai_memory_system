@@ -33,10 +33,8 @@
     </button>
     <button class="tab-btn" data-tab="graph" data-i18n="tab.graph">🔗 Graph</button>
     <button class="tab-btn" data-tab="files" data-i18n="tab.files">📂 Files</button>
+    <button class="tab-btn" data-tab="log">📡 Live Log</button>
     <button class="tab-btn" data-tab="settings" data-i18n="tab.settings">⚙️ Settings</button>
-  </nav>
-    <button class="tab-btn" data-tab="files">📂 Files</button>
-    <button class="tab-btn" data-tab="settings">⚙️ Settings</button>
   </nav>
 
   <!-- ── Main Content ── -->
@@ -203,6 +201,76 @@
           <button class="btn btn-ghost" id="fileDetailClose">✕</button>
           <div id="fileDetailContent"></div>
         </aside>
+      </div>
+    </div>
+
+    <!-- Tab: Live Log -->
+    <div class="tab-pane hidden" id="tab-log">
+      <div class="log-toolbar">
+        <div class="log-toolbar-left">
+          <span class="log-status" id="logStatus">
+            <span class="log-dot" id="logDot"></span>
+            <span id="logStatusText">Connecting…</span>
+          </span>
+          <span class="log-counter" id="logCounter">0 events</span>
+        </div>
+        <div class="log-toolbar-center">
+          <input type="text" id="logSearch" class="search-box" placeholder="🔍 Filter by path, source, project…" style="width:280px">
+          <select id="logSourceFilter" class="select-box">
+            <option value="">All sources</option>
+            <option value="http">HTTP API</option>
+            <option value="mcp">MCP</option>
+            <option value="cli">CLI</option>
+          </select>
+          <select id="logMethodFilter" class="select-box">
+            <option value="">All methods</option>
+            <option value="GET">GET</option>
+            <option value="POST">POST</option>
+            <option value="PATCH">PATCH</option>
+          </select>
+        </div>
+        <div class="log-toolbar-right">
+          <label class="log-toggle-label">
+            <input type="checkbox" id="logPause"> Pause
+          </label>
+          <label class="log-toggle-label">
+            <input type="checkbox" id="logAutoScroll" checked> Auto-scroll
+          </label>
+          <button class="btn btn-ghost btn-sm" id="logClear">🗑 Clear</button>
+          <button class="btn btn-ghost btn-sm" id="logExport">⬇ Export</button>
+        </div>
+      </div>
+
+      <div class="log-table-wrap" id="logTableWrap">
+        <table class="log-table" id="logTable">
+          <thead>
+            <tr>
+              <th class="log-col-time">Time</th>
+              <th class="log-col-source">Source</th>
+              <th class="log-col-method">Method</th>
+              <th class="log-col-path">Path / Tool</th>
+              <th class="log-col-project">Project</th>
+              <th class="log-col-status">Status</th>
+              <th class="log-col-dur">ms</th>
+              <th class="log-col-body">Payload</th>
+            </tr>
+          </thead>
+          <tbody id="logBody"></tbody>
+        </table>
+        <div class="log-empty" id="logEmpty">
+          <div class="log-empty-icon">📡</div>
+          <div>Waiting for incoming commands…</div>
+          <div style="margin-top:6px;font-size:12px;opacity:.6">Any API call, MCP tool use or CLI command will appear here in real time.</div>
+        </div>
+      </div>
+
+      <!-- Detail drawer -->
+      <div class="log-detail-drawer hidden" id="logDetailDrawer">
+        <div class="log-detail-header">
+          <span id="logDetailTitle">Event detail</span>
+          <button class="btn btn-ghost btn-sm" id="logDetailClose">✕</button>
+        </div>
+        <pre id="logDetailBody" class="log-detail-pre"></pre>
       </div>
     </div>
 
@@ -383,5 +451,6 @@
   </div>
 
   <script type="module" src="app.js"></script>
+  <script src="log.js"></script>
 </body>
 </html>

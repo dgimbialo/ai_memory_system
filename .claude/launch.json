@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "memory-dashboard",
+      "runtimeExecutable": "D:\\ai_memory_system\\.venv\\Scripts\\python.exe",
+      "runtimeArgs": ["D:\\ai_memory_system\\server.py", "--no-browser"],
+      "port": 5001,
+      "autoPort": false
+    }
+  ]
+}

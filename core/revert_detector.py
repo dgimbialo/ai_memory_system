@@ -33,10 +33,22 @@ if TYPE_CHECKING:
 # Number of distinct add+revert pairs on the same surface before warning
 UNSTABLE_THRESHOLD = 2
 
+# Hotspot guard: a surface (function/file) touched by more than this many distinct
+# entries is "actively developed", not "unstable" — unless reverts make up a real
+# fraction of the activity (see MIN_REVERT_RATIO). This is what kept a hot file
+# like ScoreNoteInserter.cpp (101 entries) from drowning the store in false
+# 'unstable' tags: many edits ≠ add/revert churn.
+HOTSPOT_MIN_ENTRIES: int = 6
+
+# On a hotspot surface, require reverts to be at least this fraction of the
+# add+revert activity before flagging. Balanced churn (e.g. 2 adds / 2 reverts =
+# 0.5) still warns; a long tail of adds with one stray revert does not.
+MIN_REVERT_RATIO: float = 0.34
+
 # Confidence penalty multiplier applied when an entry is newly tagged 'unstable'.
 # Signals instability in ranking without dropping below the decay floor.
 _UNSTABLE_CONFIDENCE_PENALTY: float = 0.85
-_MIN_CONF_FLOOR: float = 0.40
+_MIN_CONF_FLOOR: float = 0.25
 
 _ADD_RE = re.compile(
     r"\b(add|added|implement|implemented|enable|enabled|create|created|"
@@ -80,6 +92,7 @@ class RevertDetector:
         self,
         new_entry_dict: Dict[str, Any],
         all_entries: List[Dict[str, Any]],
+        apply_tags: bool = True,
     ) -> Optional[RevertWarning]:
         """Check whether the new entry triggers a revert pattern warning.
 
@@ -87,6 +100,10 @@ class RevertDetector:
         ----------
         new_entry_dict : dict   The newly added entry (already in memory).
         all_entries    : list   All entries currently in memory (including new).
+        apply_tags     : bool   When True (default) newly detected churn tags the
+                                 related entries 'unstable' and persists. Set False
+                                 for pure evaluation (e.g. recompute_unstable) so the
+                                 store is not mutated as a side effect.
 
         Returns RevertWarning if pattern detected, else None.
         """
@@ -96,9 +113,14 @@ class RevertDetector:
         if not new_funcs and not new_files:
             return None
 
-        # Collect candidates: entries (other than the new one) that share
-        # at least one function or file with the new entry.
+        # Collect candidates: entries (other than the new one) sharing the
+        # *same surface* as the new entry. We prefer function-level overlap:
+        # if the new entry names functions, a candidate must share one. File
+        # overlap alone only qualifies when neither side has function data —
+        # otherwise every entry touching a hot file (e.g. ScoreNoteInserter.cpp,
+        # 101 entries) gets falsely paired regardless of what it actually did.
         new_id = new_entry_dict.get("id", "")
+        use_functions = bool(new_funcs)
         candidates: List[Dict[str, Any]] = []
         for e in all_entries:
             if e.get("id") == new_id:
@@ -108,7 +130,13 @@ class RevertDetector:
                 continue
             e_funcs = _norm_set(e.get("functions") or [])
             e_files = _norm_set(e.get("files") or [])
-            if (new_funcs & e_funcs) or (new_files & e_files):
+            if use_functions:
+                shares = bool(new_funcs & e_funcs)
+            else:
+                # New entry has no functions: fall back to file overlap, but
+                # only against entries that also lack function granularity.
+                shares = bool(new_files & e_files) and not e_funcs
+            if shares:
                 candidates.append(e)
 
         if not candidates:
@@ -142,6 +170,16 @@ class RevertDetector:
         if pair_count < UNSTABLE_THRESHOLD:
             return None
 
+        # Hotspot guard: distinguish genuine add/revert churn from a heavily
+        # edited surface. If many distinct entries touch this surface but
+        # reverts are only a small fraction of the activity, it's active
+        # development, not instability — suppress the warning.
+        touching = len(candidates) + 1  # candidates share the surface, plus new
+        classified = len(add_entries) + len(revert_entries)
+        revert_ratio = (len(revert_entries) / classified) if classified else 0.0
+        if touching > HOTSPOT_MIN_ENTRIES and revert_ratio < MIN_REVERT_RATIO:
+            return None
+
         # Identify the shared unstable surface
         unstable_funcs: List[str] = sorted(
             new_funcs & _union_norm_sets(e.get("functions") or [] for e in candidates)
@@ -161,7 +199,7 @@ class RevertDetector:
             if e.get("id") in set(all_ids)
         ) and "unstable" in (new_entry_dict.get("tags") or [])
 
-        if not all_already_tagged:
+        if apply_tags and not all_already_tagged:
             self._tag_unstable(all_ids)
 
         surface = ", ".join(unstable_funcs) or ", ".join(unstable_files)
@@ -228,10 +266,17 @@ class RevertDetector:
 # ---------------------------------------------------------------------------
 
 def _combined_text(entry: Dict[str, Any]) -> str:
+    """Text used to classify an entry as ADD or REVERT.
+
+    Deliberately excludes the ``fix`` field: a fix describes the *mechanism*
+    of the change and almost always contains words like "added" or "removed"
+    ("Added synchronous paint", "removed redundant call"), which caused
+    unrelated bug fixes on a shared file to be mis-paired as add/revert churn.
+    Intent lives in the description (and cause), so we classify from those only.
+    """
     parts = [
         entry.get("description") or "",
         entry.get("cause") or "",
-        entry.get("fix") or "",
     ]
     return " ".join(p for p in parts if p).lower()
 

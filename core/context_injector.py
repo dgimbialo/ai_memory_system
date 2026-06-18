@@ -90,26 +90,79 @@ def _format_entry(e: dict) -> str:
     return line
 
 
+def _eff_conf(entry: dict, now: datetime) -> float:
+    """Decayed confidence, reuse-aware. Falls back to raw confidence if the
+    decay module isn't importable (keeps the hook dependency-free)."""
+    try:
+        from .decay import effective_confidence
+        anchor = entry.get("last_used") or entry.get("timestamp") or ""
+        return effective_confidence(
+            original=float(entry.get("confidence") or 0.5),
+            timestamp=anchor,
+            now=now,
+        )
+    except Exception:
+        return float(entry.get("confidence") or 0.5)
+
+
 def _build_summary(entries: list, conflicts: list, project: str | None) -> str:
+    """Relevance-first session context.
+
+    Earlier this injected the 10 *newest* active entries, so the agent saw
+    whatever was edited last rather than what's most worth knowing. Now we lead
+    with durable knowledge (decisions + high-confidence entries) and surface
+    churn-prone code, then add a little recency — deduplicated and budget-bound.
+    """
+    now = datetime.now(timezone.utc)
     lines: list[str] = []
+    shown: set = set()  # entry ids already printed — never repeat across sections
 
     project_label = project or "default"
-    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now_utc = now.strftime("%Y-%m-%d %H:%M UTC")
     lines.append(f"## Project Memory — {project_label}  ({now_utc})")
     lines.append("")
 
-    # Recent active entries
     active = [e for e in entries if e.get("status") == "active"]
-    active_sorted = sorted(active, key=lambda e: e.get("timestamp", ""), reverse=True)
-    recent = active_sorted[:RECENT_N]
 
-    if recent:
-        lines.append(f"### Recent Active Entries ({len(active)} total, showing {len(recent)})")
-        for e in recent:
+    def _emit(section_entries: list, header: str, limit: int) -> None:
+        picked = [e for e in section_entries if e.get("id") not in shown][:limit]
+        if not picked:
+            return
+        lines.append(header)
+        for e in picked:
             lines.append(_format_entry(e))
+            shown.add(e.get("id"))
         lines.append("")
 
-    # Open conflicts
+    # 1. Key decisions — the "why" that should never be relearned. Highest value.
+    decisions = sorted(
+        (e for e in active if e.get("type") == "decision"),
+        key=lambda e: _eff_conf(e, now), reverse=True,
+    )
+    _emit(decisions, "### Key Decisions", 5)
+
+    # 2. Most-trusted knowledge by decayed confidence (any remaining type).
+    high_value = sorted(active, key=lambda e: _eff_conf(e, now), reverse=True)
+    _emit(high_value, "### High-Confidence Memories", 6)
+
+    # 3. Churn-prone surfaces — warn the agent off repeatedly reverted code.
+    unstable_surfaces: dict[str, int] = {}
+    for e in active:
+        if "unstable" in (e.get("tags") or []):
+            for s in (e.get("functions") or []) or (e.get("files") or []):
+                unstable_surfaces[s] = unstable_surfaces.get(s, 0) + 1
+    if unstable_surfaces:
+        top = sorted(unstable_surfaces.items(), key=lambda kv: kv[1], reverse=True)[:8]
+        lines.append("### ⚠ Unstable / Churn-Prone (avoid re-litigating)")
+        for surface, n in top:
+            lines.append(f"- {surface}  ({n} add/revert-tagged entries)")
+        lines.append("")
+
+    # 4. A little recency so brand-new context isn't lost.
+    recent = sorted(active, key=lambda e: e.get("timestamp", ""), reverse=True)
+    _emit(recent, "### Recent Activity", 5)
+
+    # 5. Open conflicts.
     open_conflicts = [c for c in conflicts if c.get("status") != "resolved"][:CONFLICTS_N]
     if open_conflicts:
         lines.append(f"### Open Conflicts ({len(open_conflicts)})")
@@ -121,18 +174,27 @@ def _build_summary(entries: list, conflicts: list, project: str | None) -> str:
             lines.append(f"- {a} ↔ {b}  sim={sim:.2f}  {reason}")
         lines.append("")
 
-    # Stats
+    # 6. Stats footer.
     total = len(entries)
     by_type: dict[str, int] = {}
     for e in entries:
         by_type[e.get("type", "note")] = by_type.get(e.get("type", "note"), 0) + 1
     stats_parts = [f"{k}={v}" for k, v in sorted(by_type.items())]
-    lines.append(f"### Stats  total={total}  " + "  ".join(stats_parts))
+    lines.append(f"### Stats  total={total}  active={len(active)}  " + "  ".join(stats_parts))
+    lines.append("\nTip: call memory_query before editing to recall relevant fixes; "
+                 "memory_confirm/memory_reject to keep confidence accurate.")
 
     return "\n".join(lines)
 
 
 def main() -> None:
+    # The hook output (and memory content) is UTF-8; Windows consoles default to
+    # cp1252 and would crash on characters like → / ⚠ / ↔. Force UTF-8.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+        except (AttributeError, ValueError):
+            pass
     try:
         raw = sys.stdin.read()
         data = json.loads(raw) if raw.strip() else {}

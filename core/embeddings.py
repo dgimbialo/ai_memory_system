@@ -6,6 +6,7 @@ functional in offline / no-dependency environments.
 """
 from __future__ import annotations
 
+import functools
 import math
 import re
 from typing import List, Optional
@@ -43,15 +44,33 @@ def _hash_embed(text: str, dim: int = 256) -> List[float]:
     return [v / norm for v in vec]
 
 
-def embed(text: str) -> List[float]:
+@functools.lru_cache(maxsize=8192)
+def _embed_cached(text: str) -> tuple:
     model = _load_model()
     if model is not None:
         try:
-            v = model.encode(text or "", normalize_embeddings=True)
-            return [float(x) for x in v]
+            v = model.encode(text, normalize_embeddings=True)
+            return tuple(float(x) for x in v)
         except Exception:
             pass
-    return _hash_embed(text or "")
+    return tuple(_hash_embed(text))
+
+
+def embed(text: str) -> List[float]:
+    """Embed text, memoised by exact string.
+
+    query_memory / deduplicate / conflict detection all re-embed the same entry
+    texts repeatedly — once per query and once per pairwise pass. In the
+    long-lived MCP server process this cache turns an O(N) re-encode on every
+    query into a one-time cost per unique text. The tuple return keeps cached
+    vectors immutable; callers receive a fresh list.
+    """
+    return list(_embed_cached(text or ""))
+
+
+def cache_clear() -> None:
+    """Drop the in-process embedding cache (e.g. after a model swap)."""
+    _embed_cached.cache_clear()
 
 
 def cosine(a: List[float], b: List[float]) -> float:

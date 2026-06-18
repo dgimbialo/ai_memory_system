@@ -146,11 +146,13 @@ function activateTab(name) {
     if (name === 'settings')   initSettings();
     if (name === 'files')      initFileBrowser();
     if (name === 'graph')      initGraph();
+    if (name === 'log' && window.LogTab) window.LogTab.init(State.project);
   } else {
     // Refresh on revisit
     if (name === 'dashboard')  refreshDashboard();
     if (name === 'conflicts')  initConflicts();
     if (name === 'graph')      { /* graph refreshes on user demand */ }
+    if (name === 'log' && window.LogTab) window.LogTab.init(State.project);
   }
 }
 

@@ -43,6 +43,10 @@ class MemoryEntry:
     # Test-ID traceability
     # test_ids: names of tests that verify this entry's behaviour
     test_ids: List[str] = field(default_factory=list)
+    # Reinforcement signal: how many times this memory has been confirmed/reused,
+    # and when it was last reused. last_used also resets the decay clock.
+    usage_count: int = 0
+    last_used: str = ""
 
     def validate(self) -> None:
         if self.type not in VALID_TYPES:
@@ -79,6 +83,8 @@ class MemoryEntry:
         clean.setdefault("depends_on", [])
         clean.setdefault("required_by", [])
         clean.setdefault("test_ids", [])
+        clean.setdefault("usage_count", 0)
+        clean.setdefault("last_used", "")
         return cls(**clean)
 
 

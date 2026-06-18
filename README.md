@@ -66,6 +66,10 @@ One installation at `C:\ai_memory_system` serves **all** your projects — each 
 - **Git stale check** — cross-checks entries against git history to flag outdated knowledge
 - **Markdown wiki** auto-rendered with Obsidian-friendly `[[wikilinks]]`: by type, file, status
 - **HTML dashboard** — local web UI with charts, vis.js dependency graph, settings form, operations panel, i18n (EN/UK)
+- **Real-time log viewer** — SSE-driven Live Log tab shows all incoming commands (HTTP, MCP, CLI) with filtering, detail drawer, export
+- **MCP server** — universal Model Context Protocol integration for Claude Code, Cursor, VS Code, VS 2022/2026
+- **Slash commands** — `/mem*` commands in Claude Code agent chat (query, add, recent, conflicts, stats, decay, etc.)
+- **One-command IDE setup** — `connect.py` wires the system into any IDE with a single command
 - **Activity log** — every change timestamped with action and reason
 - **Learner** — analyses Copilot chat logs, extracts patterns, updates all managed project instructions
 - **Daemon** — background file watcher for non-agent edits (fallback)
@@ -185,9 +189,69 @@ python server.py --project my_app --port 8080 --no-browser
 | **Conflicts** | Side-by-side conflict cards with action buttons and reason dialog |
 | **Graph** | vis.js dependency graph — node colour by type, size by confidence, filter controls, suggest-links |
 | **Files** | File list with entry-count badges; click → auto-summary + entries |
+| **Live Log** | Real-time SSE stream of all incoming commands (HTTP API, MCP tools, CLI) with filtering, detail drawer, export |
 | **Settings** | Full settings form + Operations panel (decay, deduplication, render wiki, lint) |
 
 Language switcher (EN / UK) in the top-right corner — strings sourced from `ui/translations.js`.
+
+---
+
+## MCP Integration — Claude Code, Cursor, VS Code, Visual Studio
+
+The system exposes a universal **Model Context Protocol (MCP)** server that works with any AI agent that supports the MCP standard:
+
+### Supported IDEs
+
+- **Claude Code** — native MCP support
+- **Cursor** — native MCP support  
+- **VS Code** with Copilot / Continue / any MCP client
+- **Visual Studio 2022 (17.13+)** and **VS 2026 (18.x)** with Copilot Chat
+- **Cline**, **Aider**, and any other MCP-compatible tool
+
+### One-Command Setup
+
+```powershell
+cd C:\Path\To\Your\Project
+python C:\ai_memory_system\connect.py
+
+# Or force specific IDE(s):
+python C:\ai_memory_system\connect.py --ide claude cursor vscode vs
+```
+
+This creates/updates:
+- `.mcp.json` — Claude Code, VS 2022/2026 config (both `mcpServers` and `servers` keys)
+- `.cursor/mcp.json` — Cursor config
+- `.vscode/mcp.json` — VS Code config
+- `%APPDATA%\Microsoft\VisualStudio\globalMcpServers.json` — VS global config (applies to all solutions)
+- `.github/copilot-instructions.md` — Copilot Chat context with memory workflow
+
+Then **reload your IDE** — the agent now has 7 memory tools available.
+
+### MCP Tools (Slash Commands in Claude Code)
+
+Inside any agent chat, use these slash commands:
+
+| Command | Purpose |
+|---|---|
+| `/mem <query>` | Semantic search over project memory (top 8 results) |
+| `/memadd <type> <desc>` | Record a memory entry (bug_fix, feature, decision, note) |
+| `/memrecent [--n N]` | List most recent N entries |
+| `/memconfirm <id>` | Reinforce (↑ confidence) an entry that proved correct |
+| `/memreject <id>` | Weaken (↓ confidence) an entry that was wrong |
+| `/memconflicts` | Show unresolved conflicts |
+| `/memstats` | Store health summary |
+| `/memlist [--type] [--status]` | Filter entries by type/status |
+| `/memdecay [--apply]` | Apply confidence decay (dry-run or apply) |
+| `/memdedup [--apply]` | Find and merge near-duplicates |
+| `/memrecompute [--apply]` | Re-evaluate unstable tags |
+| `/memlint` | Run health checks |
+| `/memwiki` | Render Markdown wiki |
+| `/memui [--port N]` | Launch web dashboard |
+| `/memsession` | Create a session summary |
+
+All commands work **offline** — no external APIs, pure local Python + embeddings.
+
+**Example**: Ask the agent to "check project memory for async patterns" and it will automatically call `/mem async patterns`, surface relevant past decisions, and use that context for the current task.
 
 ---
 
@@ -297,6 +361,7 @@ ai_memory_system/
 │   ├── graph.js              # vis.js dependency graph
 │   ├── filebrowser.js        # file list + auto-summary view
 │   ├── settings.js           # settings form + operations panel
+│   ├── log.js                # real-time SSE log viewer (Live Log tab)
 │   └── translations.js       # EN/UK i18n strings
 ├── docs/
 │   └── screenshot.png        # dashboard screenshot
@@ -318,14 +383,19 @@ ai_memory_system/
 │   │   └── memory.json       # SessionStart + PostToolUse hooks
 │   └── prompts/
 │       └── record-memory.prompt.md
+├── .claude/
+│   └── launch.json           # Claude Code preview server config
 ├── tests/
 │   ├── test_conflict_resolver.py
 │   ├── test_decay.py
 │   ├── test_deduplicator.py
 │   └── test_revert_detector.py
 ├── bootstrap.py              # one-time setup: creates data/ structure
-├── run.py                    # memory CLI
+├── run.py                    # memory CLI (local)
 ├── run_infra.py              # VS Code / Copilot infra CLI
+├── mem.py                    # universal CLI wrapper (calls run.py, used by /mem* slash commands)
+├── mcp_server.py             # Model Context Protocol server (stdio JSON-RPC 2.0)
+├── connect.py                # one-command IDE integration (Claude Code, Cursor, VS Code, VS 2022/2026)
 └── server.py                 # local HTML dashboard server
 ```
 
@@ -446,6 +516,10 @@ AI-агенти починають кожну нову сесію з **чист�
 - **Перевірка застарілості Git** — крос-перевірка записів з історією git для позначення застарілих знань
 - **Вікі Markdown** — автоматично відтворена з Obsidian-friendly `[[wikilinks]]`
 - **HTML дашбоард** — локальний веб-інтерфейс з діаграмами, графом залежностей vis.js, формою параметрів, панеллю операцій, підтримкою EN/UK
+- **Синхронна журналізація** — Live Log таб з SSE потоком всіх вхідних команд (HTTP, MCP, CLI) з фільтруванням, детальним переглядом, експортом
+- **MCP сервер** — універсальна інтеграція Model Context Protocol для Claude Code, Cursor, VS Code, VS 2022/2026
+- **Слеш-команди** — `/mem*` команди в чаті agenta Claude Code (query, add, recent, conflicts, stats, decay, тощо)
+- **Одна-команда IDE інтеграція** — `connect.py` підключає систему до будь-якого IDE однією командою
 - **Журнал діяльності** — кожна зміна з часовою міткою, дією та причиною
 - **Учень** — аналізує журнали чату Copilot, розпізнає паттерни, оновлює інструкції всіх керованих проектів
 - **Демон** — фоновий спостерігач файлів для редагувань не агентом (резервний варіант)
@@ -556,7 +630,35 @@ python run.py --project <name> list_settings     # показати параме
 - **Conflicts** — карточки конфліктів з діями дозволу конфліктів
 - **Graph** — інтерактивна візуалізація графу залежностей (vis.js)
 - **Files** — список файлів з резюме та записами на файл
+- **Live Log** — синхронна журналізація всіх вхідних команд (HTTP, MCP, CLI) з фільтруванням та деталями
 - **Settings** — форма параметрів + панель операцій (decay, deduplicate, render_wiki)
+
+### MCP Інтеграція — Claude Code, Cursor, VS Code, Visual Studio
+
+Система надає універсальний сервер **Model Context Protocol (MCP)**, який працює з будь-яким AI агентом, що підтримує MCP стандарт.
+
+**Підтримувані IDE:**
+- Claude Code
+- Cursor
+- VS Code з Copilot / Continue
+- Visual Studio 2022 (17.13+) та VS 2026 (18.x)
+- Cline, Aider та інші MCP-сумісні інструменти
+
+**Однокомандне налаштування:**
+```bash
+cd C:\Path\To\Your\Project
+python C:\ai_memory_system\connect.py
+```
+
+Потім перезавантажте IDE — агент матиме доступ до 7 інструментів пам'яті.
+
+**Слеш-команди в чаті агента:**
+- `/mem <query>` — семантичний пошук
+- `/memadd` — записати нову запис
+- `/memrecent` — останні записи
+- `/memconflicts` — невирішені конфлікти
+- `/memstats` — статистика сховища
+- і ще 10 команд для підтримки та оперування пам'яттю
 
 ### Інтеграція VS Code (VS Code Integration)
 
