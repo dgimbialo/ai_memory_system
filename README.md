@@ -19,7 +19,7 @@ AI agents start every new chat session with a **blank slate** — no memory of d
 
 ---
 
-![AI Memory System — Web Dashboard](docs/screenshot.png)
+![AI Memory System - Web Dashboard](docs/AI_Foto_1.png)
 
 ---
 
