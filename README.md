@@ -1,8 +1,8 @@
 # AI Memory System
 
-A self-contained, local persistent memory engine for software projects, built for VS Code + GitHub Copilot Agent workflows.
+A self-contained, local persistent memory engine for software projects, built for VS Code + GitHub Copilot Agent workflows — with a beautiful, responsive web dashboard and universal MCP integration for Claude Code, Cursor, VS Code, and Visual Studio.
 
-It remembers decisions, tracks bugs and features, detects contradictions between historical entries, renders a structured Markdown wiki, visualises dependency graphs, and automatically feeds that knowledge back into every Copilot Agent session via VS Code hooks so the agent always has full project context without any manual #file references.
+It remembers decisions, tracks bugs and features, detects contradictions between historical entries, renders a structured Markdown wiki, visualises dependency graphs, and automatically feeds that knowledge back into every AI agent session so the agent always has full project context without any manual #file references. Real-time activity logging with SSE streaming shows all incoming commands (HTTP, MCP, CLI) as they happen.
 
 ## Why does this exist?
 
@@ -171,7 +171,7 @@ python run.py --project my_app lint
 
 ## HTML Dashboard — `server.py`
 
-A lightweight single-page web UI served entirely on localhost — no npm, no build step.
+A lightweight, beautiful single-page web UI served entirely on localhost — no npm, no build step, no external dependencies.
 
 ```powershell
 python server.py --project piobmasterpro
@@ -180,19 +180,36 @@ python server.py --project piobmasterpro
 python server.py --project my_app --port 8080 --no-browser
 ```
 
+### UI/Design Highlights
+
+- **Modern dark theme** — GitHub-inspired with accent blues, greens, and reds for status indicators
+- **Responsive layout** — grid-based design that scales from narrow to ultra-wide displays
+- **Large, readable charts** — 320px height on 2-column grid for clarity; KPI cards with hover effects
+- **Polished interactions** — smooth transitions, shadows, gradients on header/footer, hover animations
+- **Accessibility** — high contrast, readable fonts, semantic HTML, keyboard navigation
+- **Internationalization** — English / Ukrainian toggle in header, all strings translatable
+
 ### Tabs
 
 | Tab | Contents |
 |---|---|
-| **Dashboard** | KPI cards, 6 Chart.js charts (types, activity timeline, top files, confidence histogram, top tags, status breakdown) |
-| **Entries** | Filterable/searchable table with expandable detail panel, inline status & confidence editing, tag management |
-| **Conflicts** | Side-by-side conflict cards with action buttons and reason dialog |
-| **Graph** | vis.js dependency graph — node colour by type, size by confidence, filter controls, suggest-links |
-| **Files** | File list with entry-count badges; click → auto-summary + entries |
-| **Live Log** | Real-time SSE stream of all incoming commands (HTTP API, MCP tools, CLI) with filtering, detail drawer, export |
-| **Settings** | Full settings form + Operations panel (decay, deduplication, render wiki, lint) |
+| **Dashboard** | 8 KPI cards (totals, averages, conflict count) + 6 large Chart.js visualizations: entry types, activity timeline, top files, confidence histogram, top tags, status breakdown. All charts are highly interactive. |
+| **Entries** | Sortable, searchable table with 10+ columns; click any row for expandable detail pane. Inline editing of status, confidence, tags. Bulk operations via toolbar. Export as JSON/CSV. |
+| **Conflicts** | Side-by-side conflict comparison cards with accept/merge/dismiss actions, reason dialog, and full audit trail. Auto-detection and manual resolution both supported. |
+| **Graph** | Interactive vis.js dependency graph — nodes colored by entry type, sized by confidence. Filter by type/tag, pan/zoom, double-click for detail, suggest related entries. |
+| **Files** | File list with per-file entry badges; click to expand auto-summary digest + all related memory entries. Sort by name, entry count, or update time. |
+| **Live Log** | Real-time SSE stream of ALL incoming commands (HTTP, MCP, CLI) with millisecond timestamps. Filter by source/method/project, pause/resume, auto-scroll, click any row for full JSON detail drawer. Export as JSON. |
+| **Settings** | Full configuration form for decay (half-life, floor), deduplication (similarity threshold), auto-tagging keywords, and default top-k results. Operations panel: one-click decay, dedup, wiki render, lint. |
 
 Language switcher (EN / UK) in the top-right corner — strings sourced from `ui/translations.js`.
+
+### Performance & Stability
+
+- **ThreadingHTTPServer** — thread pool for efficient request handling, not a thread per request
+- **SSE client limits** — max 20 concurrent log streams to prevent resource exhaustion
+- **Graceful queue overflow** — slow clients are dropped, not allowed to block the server
+- **Real-time activity log** — 500-event ring buffer with no memory leaks
+- **Keepalive streams** — 25-second timeout + periodic pings to detect dropped connections
 
 ---
 

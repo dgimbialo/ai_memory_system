@@ -44,7 +44,15 @@ function destroyChart(id) {
 }
 
 function baseFont() {
-  return { color: CHART_DEFAULTS.color, family: "'Segoe UI', sans-serif", size: 11 };
+  return { color: CHART_DEFAULTS.color, family: "'Segoe UI', sans-serif", size: 13 };
+}
+
+function labelFont() {
+  return { color: CHART_DEFAULTS.color, family: "'Segoe UI', sans-serif", size: 12, weight: 500 };
+}
+
+function titleFont() {
+  return { color: CHART_DEFAULTS.color, family: "'Segoe UI', sans-serif", size: 14, weight: 600 };
 }
 
 // Doughnut: entry types
@@ -130,7 +138,7 @@ function renderFilesChart(topFiles) {
       scales: {
         x: { ticks: { color: CHART_DEFAULTS.color, font: baseFont() },
              grid: { color: CHART_DEFAULTS.gridColor }, beginAtZero: true },
-        y: { ticks: { color: CHART_DEFAULTS.color, font: { ...baseFont(), size: 10 } },
+        y: { ticks: { color: CHART_DEFAULTS.color, font: { ...baseFont(), size: 12 } },
              grid: { display: false } },
       },
       plugins: { legend: { display: false } },
