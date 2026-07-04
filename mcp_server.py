@@ -179,6 +179,15 @@ TOOLS: List[Dict[str, Any]] = [
 
 # ── tool implementations ──────────────────────────────────────────────────────
 
+# Session recall tracking: entry_id -> set of files it touches. When the agent
+# later saves a memory whose files overlap a recalled entry, that entry proved
+# relevant — auto-reinforce it. This closes the feedback loop that manual
+# memory_confirm never closed in practice (usage_count was 0 across all stores).
+_SESSION_RECALLS: Dict[str, set] = {}
+_AUTO_REINFORCE_DELTA: float = 0.02
+_AUTO_REINFORCE_MAX_PER_ADD: int = 3
+
+
 def _tool_memory_query(args: Dict[str, Any]) -> str:
     query = str(args.get("query", "")).strip()
     if not query:
@@ -193,6 +202,11 @@ def _tool_memory_query(args: Dict[str, Any]) -> str:
         eng.touch_used([r["id"] for r in results])
     except Exception:
         pass
+    # Remember what was recalled this session for auto-reinforcement.
+    for r in results:
+        files = {f.lower() for f in (r.get("files") or [])}
+        if files:
+            _SESSION_RECALLS[r["id"]] = files
     lines = [f"Top {len(results)} memories for: {query!r}\n"]
     for r in results:
         tags = ", ".join(r.get("tags", []))
@@ -218,11 +232,42 @@ def _tool_memory_add(args: Dict[str, Any]) -> str:
         "decisions": args.get("decisions", []) or [],
         "status": "active",
     }
-    result = _engine().add_memory(payload)
+    eng = _engine()
+    result = eng.add_memory(payload)
     entry = result.get("entry", {})
     msg = f"✅ Saved memory {entry.get('id', '?')} ({entry.get('type')})."
     if result.get("revert_warning"):
         msg += "\n⚠ " + result["revert_warning"].get("message", "Revert pattern detected.")
+
+    # Auto-reinforce recalled memories whose surface the agent just re-edited:
+    # the recall demonstrably informed real work, which is the strongest
+    # relevance signal we can get without asking anyone.
+    new_files = {f.lower() for f in (payload["files"] or [])}
+    if new_files and _SESSION_RECALLS:
+        reinforced = 0
+        for eid, files in list(_SESSION_RECALLS.items()):
+            if reinforced >= _AUTO_REINFORCE_MAX_PER_ADD:
+                break
+            if eid == entry.get("id"):
+                continue
+            if new_files & files:
+                try:
+                    eng.reinforce(
+                        eid, delta=_AUTO_REINFORCE_DELTA,
+                        reason="auto: recalled entry's files re-edited this session",
+                    )
+                    reinforced += 1
+                    del _SESSION_RECALLS[eid]  # reinforce once per session
+                except Exception:
+                    pass
+        if reinforced:
+            msg += f"\n↑ Auto-reinforced {reinforced} previously recalled memor(ies) that informed this work."
+
+    # Input-quality nudge: a bug_fix without a root cause is far less useful
+    # to future sessions. Don't block — just teach the agent.
+    if payload["type"] == "bug_fix" and not (payload["cause"] or "").strip():
+        msg += ("\n💡 Tip: this bug_fix has no 'cause'. Add the root cause next time — "
+                "it is what makes the memory valuable when the bug resurfaces.")
     return msg
 
 

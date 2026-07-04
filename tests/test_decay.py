@@ -8,7 +8,11 @@ from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from core.decay import effective_confidence, DecayEngine, HALF_LIFE_DAYS, MIN_CONFIDENCE, GRACE_PERIOD_DAYS
+from core.decay import (
+    effective_confidence, entry_effective_confidence, activity_age_days,
+    DecayEngine, HALF_LIFE_DAYS, MIN_CONFIDENCE, GRACE_PERIOD_DAYS,
+    DAYS_PER_EVENT, DECISION_HALF_LIFE_MULT,
+)
 from core.engine import MemoryEngine
 
 
@@ -55,6 +59,13 @@ def _add(engine: MemoryEngine, description: str = "test",
                 break
         engine.storage.write("memory.json", memory)
     return eid
+
+
+def _add_activity(engine: MemoryEngine, n: int) -> None:
+    """Add n fresh entries: decay is activity-relative, so an old entry only
+    ages when the project has moved on (each newer entry = DAYS_PER_EVENT)."""
+    for _ in range(n):
+        _add(engine, description="activity", confidence=0.9, days_ago=0)
 
 
 # ---------------------------------------------------------------------------
@@ -133,12 +144,23 @@ class TestDecayEnginePreview:
 
     def test_old_entry_marked_changed(self, tmp_path):
         engine = _make_engine(str(tmp_path))
-        _add(engine, confidence=0.9, days_ago=90)
+        eid = _add(engine, confidence=0.9, days_ago=90)
+        _add_activity(engine, 4)  # project moved on -> old entry ages
         rows = DecayEngine(engine).preview()
-        changed = [r for r in rows if r["changed"]]
+        changed = [r for r in rows if r["changed"] and r["id"] == eid]
         assert len(changed) == 1
         assert changed[0]["effective_confidence"] < changed[0]["original_confidence"]
         assert changed[0]["effective_confidence"] >= MIN_CONFIDENCE
+
+    def test_dormant_project_freezes_decay(self, tmp_path):
+        """An old entry in a paused project must NOT decay: no newer entries
+        means nothing has superseded the memory (activity-relative aging)."""
+        engine = _make_engine(str(tmp_path))
+        eid = _add(engine, confidence=0.9, days_ago=90)
+        rows = DecayEngine(engine).preview()
+        row = next(r for r in rows if r["id"] == eid)
+        assert row["changed"] is False
+        assert row["effective_confidence"] == pytest.approx(0.9, rel=1e-4)
 
     def test_preview_does_not_write(self, tmp_path):
         engine = _make_engine(str(tmp_path))
@@ -165,6 +187,7 @@ class TestDecayEngineApply:
     def test_dry_run_no_write(self, tmp_path):
         engine = _make_engine(str(tmp_path))
         eid = _add(engine, confidence=0.9, days_ago=90)
+        _add_activity(engine, 4)
         result = DecayEngine(engine).apply(dry_run=True)
         assert result["dry_run"] is True
         assert result["would_change"] >= 1
@@ -176,6 +199,7 @@ class TestDecayEngineApply:
     def test_apply_writes_decayed_confidence(self, tmp_path):
         engine = _make_engine(str(tmp_path))
         eid = _add(engine, confidence=0.9, days_ago=90)
+        _add_activity(engine, 4)
         result = DecayEngine(engine).apply(dry_run=False)
         assert result["changed_count"] >= 1
         mem = {e["id"]: e for e in engine._read_memory()}
@@ -209,6 +233,7 @@ class TestDecayEngineApply:
     def test_apply_logs_action(self, tmp_path):
         engine = _make_engine(str(tmp_path))
         _add(engine, confidence=0.9, days_ago=90)
+        _add_activity(engine, 4)
         DecayEngine(engine).apply(dry_run=False)
         log = engine.storage.read("activity_log.json", default=[])
         decay_logs = [l for l in log if l.get("action") == "decay_confidence"]
@@ -217,9 +242,11 @@ class TestDecayEngineApply:
     def test_apply_idempotent_after_floor(self, tmp_path):
         """Calling apply() twice on floored entry changes nothing the second time."""
         engine = _make_engine(str(tmp_path))
-        eid = _add(engine, confidence=0.9, days_ago=500)
+        eid = _add(engine, confidence=0.26, days_ago=500)
+        _add_activity(engine, 4)  # effective age 12d -> 0.26 decays to floor
         DecayEngine(engine).apply(dry_run=False)
         conf_after_first = {e["id"]: e for e in engine._read_memory()}[eid]["confidence"]
+        assert conf_after_first == pytest.approx(MIN_CONFIDENCE)
         DecayEngine(engine).apply(dry_run=False)
         conf_after_second = {e["id"]: e for e in engine._read_memory()}[eid]["confidence"]
         assert conf_after_first == pytest.approx(conf_after_second)
@@ -228,9 +255,57 @@ class TestDecayEngineApply:
         """Decay with half_life=30 decays faster than default."""
         engine = _make_engine(str(tmp_path))
         eid = _add(engine, confidence=0.9, days_ago=30)
+        _add_activity(engine, 10)  # 10 events x 3d = 30d effective age (= wall age)
         DecayEngine(engine, half_life_days=30, min_confidence=0.1).apply(dry_run=False)
         mem = {e["id"]: e for e in engine._read_memory()}
         assert mem[eid]["confidence"] == pytest.approx(0.45, rel=0.05)
+
+    def test_decision_decays_slower(self, tmp_path):
+        """Decisions age DECISION_HALF_LIFE_MULT times slower than bug fixes."""
+        engine = _make_engine(str(tmp_path))
+        bug_id = _add(engine, confidence=0.9, days_ago=60)
+        memory = engine._read_memory()
+        # Clone the same age/confidence as a decision entry
+        dec_id = _add(engine, description="a design decision", confidence=0.9, days_ago=60)
+        memory = engine._read_memory()
+        for e in memory:
+            if e["id"] == dec_id:
+                e["type"] = "decision"
+        engine.storage.write("memory.json", memory)
+        _add_activity(engine, 20)  # 60d effective age for both
+
+        rows = {r["id"]: r for r in DecayEngine(engine).preview()}
+        assert rows[dec_id]["effective_confidence"] > rows[bug_id]["effective_confidence"]
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: activity-relative aging primitives
+# ---------------------------------------------------------------------------
+
+class TestActivityRelativeAging:
+    def test_no_newer_events_zero_age(self):
+        assert activity_age_days(wall_age_days=300, newer_events=0) == 0.0
+
+    def test_age_capped_by_wall_clock(self):
+        """A burst of activity can't make memory older than it really is."""
+        assert activity_age_days(wall_age_days=10, newer_events=100) == 10.0
+
+    def test_scales_with_events(self):
+        assert activity_age_days(wall_age_days=300, newer_events=5) == pytest.approx(
+            5 * DAYS_PER_EVENT
+        )
+
+    def test_entry_effective_confidence_uses_activity(self):
+        now = datetime.now(timezone.utc)
+        old_ts = (now - timedelta(days=200)).isoformat()
+        entry = {"confidence": 0.9, "timestamp": old_ts, "type": "bug_fix"}
+        # Store contains only this entry -> no newer events -> no decay
+        eff = entry_effective_confidence(entry, sorted_timestamps=[old_ts], now=now)
+        assert eff == pytest.approx(0.9, rel=1e-4)
+        # Same entry with 20 newer timestamps -> 60d effective age -> halved
+        newer = sorted([old_ts] + [(now - timedelta(days=1)).isoformat()] * 20)
+        eff2 = entry_effective_confidence(entry, sorted_timestamps=newer, now=now)
+        assert eff2 == pytest.approx(0.45, rel=0.05)
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +364,7 @@ class TestDecayCLI:
         import subprocess
         engine = _make_engine(str(tmp_path))
         _add(engine, confidence=0.9, days_ago=90)
+        _add_activity(engine, 4)
 
         result = subprocess.run(
             ["c:/python313/python.exe",
@@ -307,6 +383,7 @@ class TestDecayCLI:
         import subprocess
         engine = _make_engine(str(tmp_path))
         eid = _add(engine, confidence=0.9, days_ago=90)
+        _add_activity(engine, 4)
 
         result = subprocess.run(
             ["c:/python313/python.exe",

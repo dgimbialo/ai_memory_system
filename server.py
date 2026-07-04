@@ -185,6 +185,10 @@ def _list_projects() -> list:
                     count = len(data) if isinstance(data, list) else 0
                 except Exception:
                     pass
+            # Hide empty stores (test artifacts, slug typos) from the dropdown —
+            # they reappear automatically once they get their first entry.
+            if count == 0:
+                continue
             projects.append({"name": d.name, "entry_count": count})
     # Include default project if it has data
     default_mem = DATA_DIR / "memory.json"
@@ -485,6 +489,21 @@ class MemoryHandler(BaseHTTPRequestHandler):
             if (e.get("depends_on") or e.get("required_by"))
         )
 
+        # Read/write ratio: is accumulated memory actually being recalled?
+        # (Audit across all projects found 8 reads vs ~390 writes — a memory
+        # that is only written is dead weight; this KPI keeps the loop honest.)
+        reads = writes = 0
+        try:
+            log = eng.storage.read("activity_log.json", default=[])
+            for a in (log if isinstance(log, list) else []):
+                action = (a.get("action") or "").lower()
+                if "query" in action or "recent" in action:
+                    reads += 1
+                elif action in ("add_memory", "mcp:memory_add"):
+                    writes += 1
+        except Exception:
+            pass
+
         self._json({
             "total":                 n,
             "by_type":               by_type,
@@ -496,6 +515,8 @@ class MemoryHandler(BaseHTTPRequestHandler):
             "confidence_histogram":  conf_buckets,
             "top_tags":              [{"tag": t, "count": c} for t, c in top_tags],
             "linked_entries":        linked,
+            "reads":                 reads,
+            "writes":                writes,
         })
 
     def _api_get_settings(self, project):

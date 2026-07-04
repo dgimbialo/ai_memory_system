@@ -47,6 +47,10 @@ class MemoryEntry:
     # and when it was last reused. last_used also resets the decay clock.
     usage_count: int = 0
     last_used: str = ""
+    # Immutable decay baseline: decay always recomputes from this value, never
+    # from the already-decayed confidence (prevents compounding). 0.0 = unset;
+    # reinforce/weaken/update_confidence establish a new baseline.
+    confidence_base: float = 0.0
 
     def validate(self) -> None:
         if self.type not in VALID_TYPES:

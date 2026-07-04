@@ -43,3 +43,10 @@ Thumbs.db
 *.sublime-workspace
 *.log
 
+.claude/settings.json
+.mcp.json
+data/file_summaries.json
+tests/test_revert_detector.py
+tests/test_revert_detector.py
+tests/test_decay.py
+tests/test_decay.py

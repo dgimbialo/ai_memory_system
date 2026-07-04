@@ -30,8 +30,20 @@ from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 if TYPE_CHECKING:
     from .engine import MemoryEngine
 
+# Version of the detection algorithm. Bump whenever the rules change so stores
+# tagged by an older detector are automatically re-evaluated (see
+# MemoryEngine._maybe_auto_recompute_unstable). v2 = function-level surface
+# matching + hotspot guard + small-project guard.
+DETECTOR_VERSION: int = 2
+
 # Number of distinct add+revert pairs on the same surface before warning
 UNSTABLE_THRESHOLD = 2
+
+# Small-project guard: in a store whose entries touch fewer than this many
+# distinct files, file overlap is meaningless — every entry touches the same
+# handful of files (a 6-file website tagged 16/16 entries unstable in a real
+# audit). Below this diversity, only function-level evidence counts.
+SMALL_PROJECT_MIN_FILES: int = 8
 
 # Hotspot guard: a surface (function/file) touched by more than this many distinct
 # entries is "actively developed", not "unstable" — unless reverts make up a real
@@ -121,6 +133,16 @@ class RevertDetector:
         # 101 entries) gets falsely paired regardless of what it actually did.
         new_id = new_entry_dict.get("id", "")
         use_functions = bool(new_funcs)
+
+        # Small-project guard: without function data, file overlap in a store
+        # with few distinct files carries no signal — skip detection entirely.
+        if not use_functions:
+            distinct_files: Set[str] = set()
+            for e in all_entries:
+                distinct_files |= _norm_set(e.get("files") or [])
+            if len(distinct_files) < SMALL_PROJECT_MIN_FILES:
+                return None
+
         candidates: List[Dict[str, Any]] = []
         for e in all_entries:
             if e.get("id") == new_id:

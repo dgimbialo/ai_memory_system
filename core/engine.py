@@ -108,6 +108,40 @@ _KEYWORD_TAGS: List[tuple] = [
 import re as _re
 
 
+# Words that look like calls in prose/code snippets but are not project functions.
+_FUNC_STOPWORDS = frozenset({
+    "if", "for", "while", "switch", "return", "sizeof", "catch", "assert",
+    "print", "printf", "sprintf", "main", "def", "len", "str", "int", "float",
+    "list", "dict", "set", "range", "type", "super", "init", "new", "delete",
+    "get", "put", "run", "call", "test", "min", "max", "abs", "round", "open",
+})
+
+_FUNC_CALL_RE = _re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{2,})\s*\(")
+
+
+def _auto_extract_functions(entry: "MemoryEntry", cap: int = 8) -> List[str]:
+    """Pull function names out of fix/description text when none were supplied.
+
+    The precise (function-level) revert detector only works where entries carry
+    a ``functions`` list — in the audit that was a single project out of ten.
+    Agents rarely fill the field, but their prose usually names the functions
+    (``fixed pairing in attachGraceNotes()``), so harvest those.
+    """
+    if entry.functions:
+        return []
+    text = " ".join(filter(None, [entry.fix or "", entry.description or ""]))
+    found: List[str] = []
+    for m in _FUNC_CALL_RE.finditer(text):
+        name = m.group(1)
+        if name.lower() in _FUNC_STOPWORDS:
+            continue
+        if name not in found:
+            found.append(name)
+        if len(found) >= cap:
+            break
+    return found
+
+
 def _auto_tag_from_description(entry: "MemoryEntry") -> List[str]:
     """Return tags to add based on keywords in description, cause, and fix.
 
@@ -194,6 +228,12 @@ class MemoryEngine:
                     combined.append(t)
             entry.tags = combined
 
+        # Harvest function names from the prose when the field wasn't supplied —
+        # function-level surface data is what makes the revert detector precise.
+        _auto_funcs = _auto_extract_functions(entry)
+        if _auto_funcs:
+            entry.functions = _auto_funcs
+
         memory = self._read_memory()
         existing_entries = [MemoryEntry.from_dict(e) for e in memory]
 
@@ -210,7 +250,19 @@ class MemoryEngine:
         if conflicts:
             self.storage.write(CONFLICTS_FILE, conflict_dicts)
 
+        # Rebuild the wiki but preserve operational metadata living in the same
+        # file — rebuild_wiki returns a fresh dict, and dropping these keys
+        # silently broke every "run at most once per day" guard (auto-decay
+        # then re-applied on EVERY add, compounding decay and flooring 84% of
+        # a real store's confidences).
+        _META_KEYS = ("last_decay_run", "last_stabilize_run",
+                      "last_conflict_triage", "unstable_detector_version",
+                      "last_rendered_at")
+        old_wiki = self.storage.read(WIKI_FILE, default={})
         wiki = self.updater.rebuild_wiki(memory)
+        for k in _META_KEYS:
+            if k in old_wiki and k not in wiki:
+                wiki[k] = old_wiki[k]
         self.storage.write(WIKI_FILE, wiki)
 
         self._log(
@@ -263,8 +315,14 @@ class MemoryEngine:
         self._maybe_auto_decay()
         self._maybe_auto_stabilize()
 
+        # Detector upgrades: clear unstable tags left by an older algorithm.
+        self._maybe_auto_recompute_unstable()
+
         # Auto conflict detection: run a full scan every N new entries.
         self._maybe_auto_detect_conflicts()
+
+        # Auto-triage: dismiss conflicts that went stale without resolution.
+        self._maybe_auto_triage_conflicts()
 
         return {
             "entry":           entry.to_dict(),
@@ -338,6 +396,141 @@ class MemoryEngine:
                 )
         except Exception:
             pass  # decay is best-effort
+
+    # ---------- detector-version auto-recompute ----------
+
+    def _maybe_auto_recompute_unstable(self) -> None:
+        """Re-evaluate all 'unstable' tags when the detector algorithm changed.
+
+        The detector version is stored in wiki.json; when a store was last
+        tagged by an older algorithm, recompute_unstable() replays detection
+        with the current rules and clears tags that no longer qualify. This is
+        what retroactively heals stores like gold-coop (16/16 false unstable
+        under detector v1) without anyone running /memrecompute by hand.
+        """
+        try:
+            from .revert_detector import DETECTOR_VERSION
+            wiki_meta = self.storage.read(WIKI_FILE, default={})
+            stored = int(wiki_meta.get("unstable_detector_version") or 0)
+            if stored >= DETECTOR_VERSION:
+                return
+
+            result = self.recompute_unstable(dry_run=False)
+
+            wiki_meta = self.storage.read(WIKI_FILE, default={})
+            wiki_meta["unstable_detector_version"] = DETECTOR_VERSION
+            self.storage.write(WIKI_FILE, wiki_meta)
+
+            cleared = len(result.get("cleared") or [])
+            if cleared:
+                self._log(
+                    "auto_recompute_unstable",
+                    [],
+                    "detector v{} upgrade cleared {} stale unstable tag(s)".format(
+                        DETECTOR_VERSION, cleared
+                    ),
+                )
+        except Exception:
+            pass  # best-effort
+
+    # ---------- conflict auto-triage ----------
+
+    _TRIAGE_AUTO_INTERVAL_DAYS: float = 1.0   # run at most once per day
+    _TRIAGE_MAX_AGE_DAYS: float = 30.0        # conflicts older than this qualify
+    _TRIAGE_CONF_CEILING: float = 0.30        # both sides must have decayed to ~floor
+
+    def triage_conflicts(
+        self,
+        max_age_days: Optional[float] = None,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """Dismiss conflicts that went stale without anyone resolving them.
+
+        A conflict where both entries have decayed to the confidence floor and
+        which has been open for over a month is a dispute nobody cares about —
+        yet it keeps both entries quarantined in status=conflict forever (a
+        real store had 21% of its entries stuck this way). Dismissing restores
+        both entries to active; the resolution is fully logged and reversible.
+        """
+        max_age = self._TRIAGE_MAX_AGE_DAYS if max_age_days is None else float(max_age_days)
+        now = datetime.now(timezone.utc)
+        conflicts = self._read_conflicts()
+        memory_map = {e.get("id"): e for e in self._read_memory()}
+
+        dismissed: List[Dict[str, Any]] = []
+        for c in list(conflicts):
+            if c.get("resolved"):
+                continue
+            # Age check
+            try:
+                ts = datetime.fromisoformat((c.get("timestamp") or "").replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                age_days = (now - ts).total_seconds() / 86400.0
+            except (ValueError, TypeError):
+                continue
+            if age_days < max_age:
+                continue
+            # Both sides at/near the floor?
+            a = memory_map.get(c.get("entry_a"))
+            b = memory_map.get(c.get("entry_b"))
+            if a is None or b is None:
+                continue
+            conf_a = float(a.get("confidence") or 0.5)
+            conf_b = float(b.get("confidence") or 0.5)
+            if conf_a > self._TRIAGE_CONF_CEILING or conf_b > self._TRIAGE_CONF_CEILING:
+                continue
+
+            dismissed.append({
+                "conflict_id": c.get("id", ""),
+                "entry_a": c.get("entry_a", ""),
+                "entry_b": c.get("entry_b", ""),
+                "age_days": round(age_days, 1),
+            })
+            if not dry_run:
+                try:
+                    self.resolve_conflict(
+                        c.get("id", ""),
+                        action="dismiss",
+                        reason="auto-triage: open {:.0f}d, both sides decayed to floor".format(age_days),
+                    )
+                except (KeyError, ValueError):
+                    dismissed.pop()
+
+        return {
+            "dismissed_count": len(dismissed),
+            "dismissed": dismissed,
+            "dry_run": dry_run,
+            "max_age_days": max_age,
+        }
+
+    def _maybe_auto_triage_conflicts(self) -> None:
+        """Daily wrapper around triage_conflicts, bookkept in wiki.json."""
+        try:
+            wiki_meta = self.storage.read(WIKI_FILE, default={})
+            last_run: str = wiki_meta.get("last_conflict_triage", "")
+            now = datetime.now(timezone.utc)
+            if last_run:
+                last = datetime.fromisoformat(last_run)
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                if (now - last).total_seconds() / 86400.0 < self._TRIAGE_AUTO_INTERVAL_DAYS:
+                    return
+
+            result = self.triage_conflicts(dry_run=False)
+
+            wiki_meta = self.storage.read(WIKI_FILE, default={})
+            wiki_meta["last_conflict_triage"] = now.isoformat()
+            self.storage.write(WIKI_FILE, wiki_meta)
+
+            if result.get("dismissed_count", 0):
+                self._log(
+                    "auto_triage_conflicts",
+                    [d["conflict_id"] for d in result["dismissed"]],
+                    "auto-dismissed {} stale conflict(s)".format(result["dismissed_count"]),
+                )
+        except Exception:
+            pass  # best-effort
 
     # ---------- auto-stabilize (unstable tag removal) ----------
 
@@ -699,9 +892,10 @@ class MemoryEngine:
             ]
 
         scored: List[tuple[float, Dict[str, Any]]] = []
-        from .decay import effective_confidence as _eff_conf
+        from .decay import entry_effective_confidence as _entry_eff
         from datetime import datetime, timezone as _tz
         _now = datetime.now(_tz.utc)
+        _sorted_ts = sorted(e.get("timestamp") or "" for e in memory)
 
         for e in memory:
             # Index over description + cause + fix + decisions for richer matching
@@ -715,12 +909,9 @@ class MemoryEngine:
             sem_score = similarity(query, text)
             # Blend semantic score with decayed confidence so stale entries rank lower.
             # Weight: 90% semantic + 10% decayed confidence — keeps relevance dominant.
-            conf_factor = _eff_conf(
-                original=float(e.get("confidence") or 0.5),
-                # Reuse resets the decay clock: rank by freshness of last_used too.
-                timestamp=(e.get("last_used") or e.get("timestamp") or ""),
-                now=_now,
-            )
+            # entry_effective_confidence applies activity-relative aging and the
+            # decision half-life bonus (one formula shared with DecayEngine).
+            conf_factor = _entry_eff(e, sorted_timestamps=_sorted_ts, now=_now)
             score = sem_score * 0.9 + conf_factor * 0.1
             scored.append((score, e))
 
@@ -835,6 +1026,8 @@ class MemoryEngine:
             if e.get("id") == entry_id:
                 old = float(e.get("confidence") or 0.5)
                 e["confidence"] = round(min(self._REINFORCE_CAP, old + d), 4)
+                # A deliberate confidence change sets a new decay baseline.
+                e["confidence_base"] = e["confidence"]
                 e["usage_count"] = int(e.get("usage_count") or 0) + 1
                 e["last_used"] = now_iso
                 found = {"id": entry_id, "old": old, "new": e["confidence"],
@@ -858,6 +1051,8 @@ class MemoryEngine:
             if e.get("id") == entry_id:
                 old = float(e.get("confidence") or 0.5)
                 e["confidence"] = round(max(self._CONF_FLOOR, old - d), 4)
+                # A deliberate confidence change sets a new decay baseline.
+                e["confidence_base"] = e["confidence"]
                 found = {"id": entry_id, "old": old, "new": e["confidence"]}
                 break
         if found is None:
@@ -1296,4 +1491,32 @@ class MemoryEngine:
             [result["entry"]["id"]],
             f"aggregated {len(recent)} recent entries over {len(agg_files)} files",
         )
+        self._rollup_session_summaries(keep=5)
         return result
+
+    _SESSION_SUMMARY_KEEP: int = 5
+
+    def _rollup_session_summaries(self, keep: int = 5) -> int:
+        """Supersede session-summary notes beyond the newest ``keep``.
+
+        Session summaries are snapshots, not knowledge: 29 of them piled up in
+        one real project, all decayed to the floor, polluting type=note stats
+        and query results. Only the recent ones carry context worth recalling.
+        """
+        try:
+            memory = self._read_memory()
+            summaries = [
+                e for e in memory
+                if "session-summary" in (e.get("tags") or [])
+                and e.get("status") == "active"
+            ]
+            summaries.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
+            stale = summaries[keep:]
+            for e in stale:
+                self.update_status(
+                    e["id"], "superseded",
+                    reason=f"session-summary rollup: keeping newest {keep}",
+                )
+            return len(stale)
+        except Exception:
+            return 0  # rollup is best-effort, never blocks session_summary

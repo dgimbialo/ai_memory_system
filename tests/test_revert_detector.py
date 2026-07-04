@@ -290,12 +290,23 @@ class TestPrecisionGuards:
         assert before == after
 
 
+def _diverse_filler(n: int = 8) -> list:
+    """Unrelated entries touching distinct files, so the store does not look
+    like a small project (file-overlap evidence requires >= 8 distinct files)."""
+    return [
+        {"id": f"fill{i}", "description": f"unrelated work {i}",
+         "cause": "", "fix": f"touched module {i}",
+         "functions": [], "files": [f"Module{i}.cpp"], "status": "active", "tags": []}
+        for i in range(n)
+    ]
+
+
 class TestFileBasedDetection:
     def test_file_surface_triggers_warning(self, tmp_path):
         """Detection also works on shared files when no functions overlap."""
         engine = _make_engine(str(tmp_path))
         f = ["ScoreNoteInserter.cpp"]
-        entries = [
+        entries = _diverse_filler(8) + [
             {"id": "h1", "description": "add provisional render",
              "cause": "", "fix": "implement render",
              "functions": [], "files": f, "status": "active", "tags": []},
@@ -313,6 +324,29 @@ class TestFileBasedDetection:
         result = detector.check(new_entry, entries + [new_entry])
         assert result is not None
         assert "scorenoteinserter.cpp" in result.unstable_files
+
+    def test_small_project_file_overlap_suppressed(self, tmp_path):
+        """In a store with few distinct files (a 6-file website), file overlap
+        is meaningless: every entry touches the same files. No function data +
+        small project => never warn (real audit: 16/16 false unstable tags)."""
+        engine = _make_engine(str(tmp_path))
+        f = ["index.html", "style.css"]
+        entries = [
+            {"id": "s1", "description": "add gallery section",
+             "cause": "", "fix": "implement gallery",
+             "functions": [], "files": f, "status": "active", "tags": []},
+            {"id": "s2", "description": "remove gallery section",
+             "cause": "", "fix": "delete gallery",
+             "functions": [], "files": f, "status": "active", "tags": []},
+            {"id": "s3", "description": "add gallery v2",
+             "cause": "", "fix": "enable gallery v2",
+             "functions": [], "files": f, "status": "active", "tags": []},
+        ]
+        new_entry = {"id": "s4", "description": "remove gallery v2",
+                     "cause": "", "fix": "deleted gallery v2",
+                     "functions": [], "files": f, "status": "active", "tags": []}
+        result = RevertDetector(engine).check(new_entry, entries + [new_entry])
+        assert result is None
 
 
 # ---------------------------------------------------------------------------

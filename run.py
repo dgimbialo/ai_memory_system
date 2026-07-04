@@ -259,6 +259,14 @@ def cmd_recompute_unstable(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_triage_conflicts(args: argparse.Namespace) -> int:
+    result = _engine(args.project).triage_conflicts(
+        max_age_days=args.max_age_days, dry_run=args.dry_run
+    )
+    _print(result)
+    return 0
+
+
 def cmd_update_instructions(args: argparse.Namespace) -> int:
     result = _engine(args.project).update_instructions(
         project_path=args.project_path,
@@ -556,6 +564,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write changes to disk (default when --dry-run is omitted)",
     )
     ru.set_defaults(func=cmd_recompute_unstable)
+
+    tc = sub.add_parser(
+        "triage_conflicts",
+        help="Auto-dismiss stale conflicts (old + both sides decayed to floor)",
+    )
+    tc.add_argument("--max-age-days", type=float, default=None,
+                    help="Minimum conflict age to qualify (default 30)")
+    tc.add_argument("--dry-run", dest="dry_run", action="store_true", default=False)
+    tc.add_argument("--apply", dest="dry_run", action="store_false")
+    tc.set_defaults(func=cmd_triage_conflicts)
 
     rf = sub.add_parser("reinforce", help="Confirm a memory: raise confidence, count use, reset decay clock")
     rf.add_argument("id", help="Entry id to reinforce")

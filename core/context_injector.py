@@ -195,13 +195,35 @@ def main() -> None:
             _stream.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
         except (AttributeError, ValueError):
             pass
-    try:
-        raw = sys.stdin.read()
-        data = json.loads(raw) if raw.strip() else {}
-    except (json.JSONDecodeError, OSError):
-        data = {}
 
-    project = _detect_project_from_session(data)
+    # CLI flags let non-VS-Code hosts call the injector directly:
+    #   --project <slug>          explicit project (skips stdin detection)
+    #   --format plain|json       plain = raw markdown on stdout (Claude Code
+    #                             SessionStart hooks add stdout to context);
+    #                             json  = VS Code hook protocol (default)
+    argv = sys.argv[1:]
+    cli_project: str | None = None
+    out_format = "json"
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--project" and i + 1 < len(argv):
+            cli_project = argv[i + 1]
+            i += 2
+        elif argv[i] == "--format" and i + 1 < len(argv):
+            out_format = argv[i + 1].strip().lower()
+            i += 2
+        else:
+            i += 1
+
+    data = {}
+    if cli_project is None and not sys.stdin.isatty():
+        try:
+            raw = sys.stdin.read()
+            data = json.loads(raw) if raw.strip() else {}
+        except (json.JSONDecodeError, OSError):
+            data = {}
+
+    project = cli_project or _detect_project_from_session(data)
 
     # Resolve data directory
     if project:
@@ -214,7 +236,8 @@ def main() -> None:
 
     if not entries and not conflicts:
         # Nothing stored yet — don't clutter the context
-        print(json.dumps({"continue": True}))
+        if out_format == "json":
+            print(json.dumps({"continue": True}))
         sys.exit(0)
 
     summary = _build_summary(entries, conflicts, project)
@@ -222,6 +245,10 @@ def main() -> None:
     # Truncate if too long
     if len(summary) > MAX_CHARS:
         summary = summary[:MAX_CHARS] + "\n\n... (truncated)"
+
+    if out_format == "plain":
+        print(summary)
+        sys.exit(0)
 
     result = {
         "continue": True,

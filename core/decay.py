@@ -36,6 +36,7 @@ Usage
 """
 from __future__ import annotations
 
+import bisect
 import math
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
@@ -57,6 +58,35 @@ _EXEMPT_STATUS = {"superseded", "resolved"}
 # How many days before decay even starts (entries younger than this are untouched)
 GRACE_PERIOD_DAYS: float = 7.0
 
+# ── Activity-relative aging ───────────────────────────────────────────────────
+# Memory staleness is measured against how much the *project* has moved on, not
+# against the calendar: each entry added after this one contributes
+# DAYS_PER_EVENT of "effective age", capped by the wall-clock age. A project on
+# pause therefore freezes its memory (nothing new was learned that could
+# supersede it), while an actively-developed project ages entries as before.
+# Real-world audit motivating this: fast_acquisition_device decayed to the
+# floor during a 2-month pause, exactly when its memory was most needed.
+DAYS_PER_EVENT: float = 3.0
+
+# Decisions age 4x slower than other entries: a design decision holds until it
+# is explicitly superseded, unlike a bug-fix note that goes stale naturally.
+# Audit finding: all 13 piobmasterpro decisions had sunk to the 0.25 floor.
+DECISION_HALF_LIFE_MULT: float = 4.0
+
+
+def activity_age_days(
+    wall_age_days: float,
+    newer_events: int,
+    days_per_event: float = DAYS_PER_EVENT,
+) -> float:
+    """Effective age of a memory given project activity since it was written.
+
+    ``newer_events`` is the number of entries added to the store after this
+    entry's anchor timestamp. The effective age never exceeds the wall-clock
+    age (a burst of activity cannot make memory older than it really is).
+    """
+    return min(float(wall_age_days), float(newer_events) * days_per_event)
+
 
 def effective_confidence(
     original: float,
@@ -64,6 +94,7 @@ def effective_confidence(
     half_life_days: float = HALF_LIFE_DAYS,
     min_confidence: float = MIN_CONFIDENCE,
     now: Optional[datetime] = None,
+    age_days_override: Optional[float] = None,
 ) -> float:
     """Compute the decayed confidence for a single entry.
 
@@ -74,6 +105,8 @@ def effective_confidence(
     half_life_days : days until confidence halves (default 60)
     min_confidence : absolute floor (default 0.40)
     now            : datetime to use as "now" (defaults to UTC now, injectable for tests)
+    age_days_override : replace the wall-clock age with an activity-relative
+                        age (see activity_age_days); timestamp must still parse
 
     Returns
     -------
@@ -89,12 +122,60 @@ def effective_confidence(
     except (ValueError, TypeError):
         return float(original)
 
+    if age_days_override is not None:
+        age_days = float(age_days_override)
+
     if age_days < GRACE_PERIOD_DAYS:
         return float(original)
 
     factor = math.pow(0.5, age_days / half_life_days)
     decayed = float(original) * factor
     return max(decayed, float(min_confidence))
+
+
+def entry_effective_confidence(
+    entry: Dict[str, Any],
+    sorted_timestamps: Optional[List[str]] = None,
+    half_life_days: float = HALF_LIFE_DAYS,
+    min_confidence: float = MIN_CONFIDENCE,
+    now: Optional[datetime] = None,
+) -> float:
+    """Decayed confidence for a full entry dict — the one true formula.
+
+    Combines every rule in one place so DecayEngine, query ranking and the
+    context injector cannot drift apart:
+      * anchor = freshest of ``last_used`` / ``timestamp`` (reuse resets clock)
+      * activity-relative age when ``sorted_timestamps`` (all entries' write
+        timestamps, ascending) is provided — otherwise wall-clock age
+      * decisions decay DECISION_HALF_LIFE_MULT times slower
+    """
+    anchor = _anchor_ts(entry)
+    hl = half_life_days * (
+        DECISION_HALF_LIFE_MULT if entry.get("type") == "decision" else 1.0
+    )
+
+    age_override: Optional[float] = None
+    if sorted_timestamps and anchor:
+        if now is None:
+            now = datetime.now(timezone.utc)
+        try:
+            ts = datetime.fromisoformat(anchor)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            wall_age = (now - ts).total_seconds() / 86400.0
+            newer = len(sorted_timestamps) - bisect.bisect_right(sorted_timestamps, anchor)
+            age_override = activity_age_days(wall_age, newer)
+        except (ValueError, TypeError):
+            age_override = None
+
+    return effective_confidence(
+        original=float(entry.get("confidence") or 0.5),
+        timestamp=anchor,
+        half_life_days=hl,
+        min_confidence=min_confidence,
+        now=now,
+        age_days_override=age_override,
+    )
 
 
 class DecayEngine:
@@ -122,10 +203,12 @@ class DecayEngine:
         are included with ``changed: false``.
         """
         now = datetime.now(timezone.utc)
+        memory = self._engine._read_memory()
+        sorted_ts = sorted(e.get("timestamp") or "" for e in memory)
         result = []
-        for e in self._engine._read_memory():
+        for e in memory:
             orig = float(e.get("confidence") or 0.5)
-            eff = self._eff(e, now)
+            eff = self._eff(e, now, sorted_ts)
             result.append({
                 "id":                   e.get("id", ""),
                 "description":          (e.get("description") or "")[:120],
@@ -157,6 +240,7 @@ class DecayEngine:
         """
         now = datetime.now(timezone.utc)
         memory = self._engine._read_memory()
+        sorted_ts = sorted(e.get("timestamp") or "" for e in memory)
         changes: List[Dict[str, Any]] = []
         changed_count = 0
         skipped_count = 0
@@ -167,7 +251,12 @@ class DecayEngine:
                 continue
 
             orig = float(e.get("confidence") or 0.5)
-            eff = self._eff(e, now)
+            # Decay is always computed from an immutable base, never from the
+            # already-decayed stored value — otherwise every apply() compounds
+            # the previous one (a real store hit the floor within weeks because
+            # a broken daily guard re-applied decay on every single add).
+            base = float(e.get("confidence_base") or orig)
+            eff = self._eff({**e, "confidence": base}, now, sorted_ts)
             age = self._age_days(e, now)
 
             if age < GRACE_PERIOD_DAYS:
@@ -187,6 +276,8 @@ class DecayEngine:
             })
 
             if not dry_run:
+                if "confidence_base" not in e:
+                    e["confidence_base"] = round(base, 4)
                 e["confidence"] = round(eff, 4)
                 changed_count += 1
 
@@ -215,10 +306,15 @@ class DecayEngine:
     # Private
     # ------------------------------------------------------------------
 
-    def _eff(self, entry: Dict[str, Any], now: datetime) -> float:
-        return effective_confidence(
-            original=float(entry.get("confidence") or 0.5),
-            timestamp=_anchor_ts(entry),
+    def _eff(
+        self,
+        entry: Dict[str, Any],
+        now: datetime,
+        sorted_ts: Optional[List[str]] = None,
+    ) -> float:
+        return entry_effective_confidence(
+            entry,
+            sorted_timestamps=sorted_ts,
             half_life_days=self.half_life_days,
             min_confidence=self.min_confidence,
             now=now,

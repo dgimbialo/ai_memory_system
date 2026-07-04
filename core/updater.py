@@ -43,6 +43,8 @@ class Updater:
         for e in memory:
             if e.get("id") == entry_id:
                 e["confidence"] = float(confidence)
+                # Manual confidence edits set a new decay baseline too.
+                e["confidence_base"] = float(confidence)
                 return e
         raise KeyError(f"Entry '{entry_id}' not found")
 

@@ -95,13 +95,40 @@ def _server_block(python_exe: str, slug: str, *, vscode_style: bool) -> Dict[str
 
 # ── per-IDE config writers (return human-readable status line) ────────────────
 
-def _connect_claude_code(project: Path, python_exe: str, slug: str) -> str:
+def _connect_claude_code(project: Path, python_exe: str, slug: str) -> List[str]:
+    results: List[str] = []
+
     path = project / ".mcp.json"
     cfg = _load_json(path)
     servers = cfg.setdefault("mcpServers", {})
     servers[SERVER_KEY] = _server_block(python_exe, slug, vscode_style=False)
     _write_json(path, cfg)
-    return f"Claude Code  → {path}"
+    results.append(f"Claude Code  → {path}")
+
+    # SessionStart hook: inject the memory summary into every new Claude Code
+    # session automatically. This is the read half of the loop — without it
+    # agents write memories but never recall them (audited: 8 reads vs ~390
+    # writes across all projects before this hook existed).
+    settings_path = project / ".claude" / "settings.json"
+    settings = _load_json(settings_path)
+    injector = ROOT / "core" / "context_injector.py"
+    hook_cmd = f'"{python_exe}" "{injector}" --project {slug} --format plain'
+
+    hooks = settings.setdefault("hooks", {})
+    session_start = hooks.setdefault("SessionStart", [])
+    already = any(
+        h.get("command") == hook_cmd
+        for grp in session_start if isinstance(grp, dict)
+        for h in grp.get("hooks", []) if isinstance(h, dict)
+    )
+    if not already:
+        session_start.append({"hooks": [{"type": "command", "command": hook_cmd}]})
+        _write_json(settings_path, settings)
+        results.append(f"Claude hook  → {settings_path}  (SessionStart memory injection)")
+    else:
+        results.append(f"Claude hook  → {settings_path}  (already configured)")
+
+    return results
 
 
 def _connect_cursor(project: Path, python_exe: str, slug: str) -> str:
@@ -289,7 +316,7 @@ def connect(project: Path, *, ides: List[str], with_copilot: bool) -> Dict[str, 
 
     actions: List[str] = []
     if "claude" in targets:
-        actions.append(_connect_claude_code(project, python_exe, slug))
+        actions.extend(_connect_claude_code(project, python_exe, slug))
     if "cursor" in targets:
         actions.append(_connect_cursor(project, python_exe, slug))
     if "vscode" in targets:

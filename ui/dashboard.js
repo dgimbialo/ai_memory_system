@@ -26,6 +26,7 @@ function renderKPIs(stats) {
   set('kpi-conflicts',  stats.open_conflicts ?? 0);
   set('kpi-linked',     stats.linked_entries ?? 0);
   set('kpi-active',     stats.by_status?.active ?? 0);
+  set('kpi-recall',     `${stats.reads ?? 0} / ${stats.writes ?? 0}`);
 
   // Conflict banner
   const n = stats.open_conflicts ?? 0;
