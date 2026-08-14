@@ -90,19 +90,40 @@ def _format_entry(e: dict) -> str:
     return line
 
 
+_SORTED_TS: list = []  # write timestamps of all entries, set by _build_summary
+
+
 def _eff_conf(entry: dict, now: datetime) -> float:
-    """Decayed confidence, reuse-aware. Falls back to raw confidence if the
-    decay module isn't importable (keeps the hook dependency-free)."""
+    """Decayed confidence via the shared formula (activity-relative age,
+    decision + usage bonuses). Falls back to raw confidence if the decay
+    module isn't importable (keeps the hook dependency-free)."""
     try:
-        from .decay import effective_confidence
-        anchor = entry.get("last_used") or entry.get("timestamp") or ""
-        return effective_confidence(
-            original=float(entry.get("confidence") or 0.5),
-            timestamp=anchor,
-            now=now,
+        from .decay import entry_effective_confidence
+        return entry_effective_confidence(
+            entry, sorted_timestamps=_SORTED_TS or None, now=now
         )
     except Exception:
         return float(entry.get("confidence") or 0.5)
+
+
+def _log_injection(data_dir: Path, project: str | None, n_entries: int) -> None:
+    """Record the injection as a READ in the activity log.
+
+    Session injection is the primary read channel, yet it used to be invisible
+    to the Reads/Writes metric (audit #2: reads=0 in projects whose hook fired
+    daily). Best-effort — never blocks or fails the hook.
+    """
+    try:
+        from core.storage import Storage
+        Storage(data_dir).append_log("activity_log.json", {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "action": "inject_context",
+            "affected": [],
+            "reason": f"SessionStart hook injected memory summary "
+                      f"({n_entries} entries considered, project={project or 'default'})",
+        })
+    except Exception:
+        pass
 
 
 def _build_summary(entries: list, conflicts: list, project: str | None) -> str:
@@ -114,6 +135,8 @@ def _build_summary(entries: list, conflicts: list, project: str | None) -> str:
     churn-prone code, then add a little recency — deduplicated and budget-bound.
     """
     now = datetime.now(timezone.utc)
+    global _SORTED_TS
+    _SORTED_TS = sorted(e.get("timestamp") or "" for e in entries)
     lines: list[str] = []
     shown: set = set()  # entry ids already printed — never repeat across sections
 
@@ -134,15 +157,19 @@ def _build_summary(entries: list, conflicts: list, project: str | None) -> str:
             shown.add(e.get("id"))
         lines.append("")
 
+    # Recency tiebreak: floor-tied entries rank by freshest use, not list order.
+    def _rank_key(e: dict):
+        return (_eff_conf(e, now), e.get("last_used") or e.get("timestamp") or "")
+
     # 1. Key decisions — the "why" that should never be relearned. Highest value.
     decisions = sorted(
         (e for e in active if e.get("type") == "decision"),
-        key=lambda e: _eff_conf(e, now), reverse=True,
+        key=_rank_key, reverse=True,
     )
     _emit(decisions, "### Key Decisions", 5)
 
     # 2. Most-trusted knowledge by decayed confidence (any remaining type).
-    high_value = sorted(active, key=lambda e: _eff_conf(e, now), reverse=True)
+    high_value = sorted(active, key=_rank_key, reverse=True)
     _emit(high_value, "### High-Confidence Memories", 6)
 
     # 3. Churn-prone surfaces — warn the agent off repeatedly reverted code.
@@ -241,6 +268,9 @@ def main() -> None:
         sys.exit(0)
 
     summary = _build_summary(entries, conflicts, project)
+
+    # Injection IS a read of the store — make it visible to the loop metric.
+    _log_injection(data_dir, project, len(entries))
 
     # Truncate if too long
     if len(summary) > MAX_CHARS:

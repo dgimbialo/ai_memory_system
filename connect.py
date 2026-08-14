@@ -300,6 +300,41 @@ def _setup_copilot_hooks(project: Path, slug: str) -> str:
         return f"Copilot      → skipped ({exc})"
 
 
+# ── connected-projects registry ────────────────────────────────────────────────
+
+REGISTRY_FILE = ROOT / "data" / "connected_projects.json"
+
+
+def _register_project(slug: str, project: Path) -> None:
+    """Remember where each connected project lives so `--all` can refresh
+    every one of them after the memory system gains new integration pieces.
+
+    Audit #2 finding: the SessionStart hook shipped in July was only ever
+    installed in the one project where connect.py happened to be re-run —
+    every other project kept writing memories nobody read.
+    """
+    from datetime import datetime, timezone
+    reg = _load_json(REGISTRY_FILE)
+    reg[slug] = {
+        "path": str(project),
+        "last_connected": datetime.now(timezone.utc).isoformat(),
+    }
+    _write_json(REGISTRY_FILE, reg)
+
+
+def connect_all(*, ides: List[str], with_copilot: bool) -> List[Dict[str, Any]]:
+    """Re-run connect() for every registered project that still exists."""
+    reg = _load_json(REGISTRY_FILE)
+    results: List[Dict[str, Any]] = []
+    for slug, info in sorted(reg.items()):
+        path = Path(info.get("path", ""))
+        if not path.exists():
+            print(f"  (skip {slug}: path gone — {path})")
+            continue
+        results.append(connect(path, ides=ides, with_copilot=with_copilot))
+    return results
+
+
 # ── main ───────────────────────────────────────────────────────────────────────
 
 def connect(project: Path, *, ides: List[str], with_copilot: bool) -> Dict[str, Any]:
@@ -325,6 +360,8 @@ def connect(project: Path, *, ides: List[str], with_copilot: bool) -> Dict[str, 
             actions.append(_setup_copilot_hooks(project, slug))
     if "vs" in targets:
         actions.extend(_connect_vs(project, python_exe, slug))
+
+    _register_project(slug, project)
 
     return {
         "project": str(project),
@@ -365,6 +402,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--ide", action="append", choices=["claude", "cursor", "vscode", "vs"], default=[],
         help="Force a specific IDE (repeatable). Default: auto-detect.",
     )
+    p.add_argument("--all", action="store_true",
+                   help="Re-connect every previously registered project (refresh hooks/configs).")
     p.add_argument("--no-copilot", action="store_true", help="Skip VS Code/Copilot hook scaffolding.")
     p.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of a report.")
     return p
@@ -372,6 +411,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: List[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    if args.all:
+        results = connect_all(ides=args.ide, with_copilot=not args.no_copilot)
+        if args.json:
+            print(json.dumps(results, indent=2, ensure_ascii=False))
+        else:
+            for r in results:
+                _print_report(r)
+            print(f"  Refreshed {len(results)} project(s) from the registry.")
+        return 0
+
     project = Path(args.path)
     if not project.exists():
         print(f"Error: project path does not exist: {project}", file=sys.stderr)

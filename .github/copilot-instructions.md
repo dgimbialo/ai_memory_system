@@ -66,3 +66,15 @@ c:/python313/python.exe C:/ai_memory_system/run.py --project <project_name> rend
 *Based on 4438 Copilot activity event(s).*
 
 **Top topics**: type, model, terms, enable, access, latest, learn, more, serves, https
+
+## AI Memory System (ai-memory MCP)
+
+This project has a persistent memory store (`ai_memory_system`).
+**Before modifying any code**, call the `memory_query` tool with a description
+of what you are about to change — this surfaces past bug fixes, design decisions,
+and churn-prone functions so you avoid re-introducing reverted code.
+
+After completing a fix or decision, call `memory_add` to record it.
+
+Key tools: `memory_query`, `memory_add`, `memory_confirm`, `memory_reject`,
+`memory_recent`, `memory_conflicts`, `memory_stats`.

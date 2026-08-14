@@ -202,6 +202,20 @@ class MemoryEngine:
             },
         )
 
+    # Birth confidence by entry type when the caller does not set one.
+    # A universal 0.5 birth sat one half-life away from the 0.25 floor, so any
+    # unqueried entry bottomed out within two months (audit #2: 72% re-floored).
+    # Decisions start high (they hold until superseded); notes are cheap.
+    _BIRTH_CONFIDENCE: Dict[str, float] = {
+        "decision": 0.75,
+        "bug_fix":  0.60,
+        "feature":  0.60,
+        "note":     0.45,
+    }
+
+    # Cap on conflicts recorded per single add_memory (strongest first).
+    _MAX_NEW_CONFLICTS_PER_ADD: int = 3
+
     # ---------- public API ----------
     def add_memory(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Validate, append, run conflict detection, refresh wiki."""
@@ -214,6 +228,15 @@ class MemoryEngine:
         # links; add_link below will set both sides atomically.
         if raw_depends_on and isinstance(payload, dict):
             payload = {k: v for k, v in payload.items() if k != "depends_on"}
+
+        # Type-aware birth confidence (only when the caller didn't specify one).
+        if isinstance(payload, dict) and payload.get("confidence") in (None, ""):
+            payload = {
+                **payload,
+                "confidence": self._BIRTH_CONFIDENCE.get(
+                    payload.get("type", "note"), 0.5
+                ),
+            }
 
         entry = MemoryEntry.from_dict(payload) if not isinstance(payload, MemoryEntry) else payload
         entry.validate()
@@ -239,8 +262,12 @@ class MemoryEngine:
 
         self.updater.merge_entry(memory, entry)
 
-        # Conflict detection
+        # Conflict detection — bounded: one add can legitimately conflict with
+        # at most a few prior entries; recording every match floods the queue
+        # (the same burst problem as full scans, just death by a thousand cuts).
         conflicts = find_conflicts_for(entry, existing_entries)
+        conflicts.sort(key=lambda c: float(getattr(c, "similarity", 0.0)), reverse=True)
+        conflicts = conflicts[: self._MAX_NEW_CONFLICTS_PER_ADD]
         conflict_dicts = self._read_conflicts()
         for c in conflicts:
             self.updater.mark_conflict(memory, c.entry_a, c.entry_b)
@@ -257,7 +284,7 @@ class MemoryEngine:
         # a real store's confidences).
         _META_KEYS = ("last_decay_run", "last_stabilize_run",
                       "last_conflict_triage", "unstable_detector_version",
-                      "last_rendered_at")
+                      "last_rendered_at", "last_hygiene_run")
         old_wiki = self.storage.read(WIKI_FILE, default={})
         wiki = self.updater.rebuild_wiki(memory)
         for k in _META_KEYS:
@@ -323,6 +350,9 @@ class MemoryEngine:
 
         # Auto-triage: dismiss conflicts that went stale without resolution.
         self._maybe_auto_triage_conflicts()
+
+        # Daily hygiene: conservative dedup + session-summary rollup.
+        self._maybe_daily_hygiene()
 
         return {
             "entry":           entry.to_dict(),
@@ -438,6 +468,10 @@ class MemoryEngine:
     _TRIAGE_AUTO_INTERVAL_DAYS: float = 1.0   # run at most once per day
     _TRIAGE_MAX_AGE_DAYS: float = 30.0        # conflicts older than this qualify
     _TRIAGE_CONF_CEILING: float = 0.30        # both sides must have decayed to ~floor
+    # Fast tier: when both sides have clearly decayed (≤0.35), two weeks of
+    # nobody caring is verdict enough — don't let the queue outlive relevance.
+    _TRIAGE_FAST_AGE_DAYS: float = 14.0
+    _TRIAGE_FAST_CONF_CEILING: float = 0.35
 
     def triage_conflicts(
         self,
@@ -469,8 +503,6 @@ class MemoryEngine:
                 age_days = (now - ts).total_seconds() / 86400.0
             except (ValueError, TypeError):
                 continue
-            if age_days < max_age:
-                continue
             # Both sides at/near the floor?
             a = memory_map.get(c.get("entry_a"))
             b = memory_map.get(c.get("entry_b"))
@@ -478,7 +510,13 @@ class MemoryEngine:
                 continue
             conf_a = float(a.get("confidence") or 0.5)
             conf_b = float(b.get("confidence") or 0.5)
-            if conf_a > self._TRIAGE_CONF_CEILING or conf_b > self._TRIAGE_CONF_CEILING:
+            both_max = max(conf_a, conf_b)
+            # Standard tier: old + both at the floor. Fast tier: clearly
+            # decayed sides qualify after two weeks instead of a month.
+            standard = age_days >= max_age and both_max <= self._TRIAGE_CONF_CEILING
+            fast = (age_days >= self._TRIAGE_FAST_AGE_DAYS
+                    and both_max <= self._TRIAGE_FAST_CONF_CEILING)
+            if not (standard or fast):
                 continue
 
             dismissed.append({
@@ -528,6 +566,50 @@ class MemoryEngine:
                     "auto_triage_conflicts",
                     [d["conflict_id"] for d in result["dismissed"]],
                     "auto-dismissed {} stale conflict(s)".format(result["dismissed_count"]),
+                )
+        except Exception:
+            pass  # best-effort
+
+    # ---------- daily hygiene (dedup + summary rollup) ----------
+
+    _HYGIENE_AUTO_INTERVAL_DAYS: float = 1.0
+    # Unattended merges demand near-certainty: identical file sets AND
+    # near-identical text (audit #2: 3 verbatim TASK-09 copies were occupying
+    # half of one project's High-Confidence injection slots).
+    _AUTO_DEDUP_THRESHOLD: float = 0.97
+
+    def _maybe_daily_hygiene(self) -> None:
+        """Once per day: merge verbatim duplicates and roll up old session
+        summaries — the two litter sources that silently degrade injection
+        quality. Best-effort, never blocks add_memory."""
+        try:
+            wiki_meta = self.storage.read(WIKI_FILE, default={})
+            last_run: str = wiki_meta.get("last_hygiene_run", "")
+            now = datetime.now(timezone.utc)
+            if last_run:
+                last = datetime.fromisoformat(last_run)
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                if (now - last).total_seconds() / 86400.0 < self._HYGIENE_AUTO_INTERVAL_DAYS:
+                    return
+
+            from .deduplicator import Deduplicator
+            result = Deduplicator(self, self._AUTO_DEDUP_THRESHOLD).apply(
+                dry_run=False, require_same_files=True
+            )
+            rolled = self._rollup_session_summaries(keep=self._SESSION_SUMMARY_KEEP)
+
+            wiki_meta = self.storage.read(WIKI_FILE, default={})
+            wiki_meta["last_hygiene_run"] = now.isoformat()
+            self.storage.write(WIKI_FILE, wiki_meta)
+
+            merged = result.get("merged_count", 0)
+            if merged or rolled:
+                self._log(
+                    "auto_hygiene",
+                    [],
+                    "daily hygiene: merged {} duplicate cluster(s), rolled up {} "
+                    "old session summar(ies)".format(merged, rolled),
                 )
         except Exception:
             pass  # best-effort
@@ -825,6 +907,11 @@ class MemoryEngine:
             )
         return healed
 
+    # Burst guard: one full scan on a large store can mint dozens of conflicts
+    # at once (audit #2: 27 in a single day), outrunning triage and drowning
+    # the review queue. Keep only the strongest N new ones per scan.
+    _MAX_NEW_CONFLICTS_PER_SCAN: int = 10
+
     def detect_conflicts(self) -> List[Dict[str, Any]]:
         """Re-scan all memory and refresh conflicts.json."""
         # Heal any entries stuck in conflict status without a matching record
@@ -835,24 +922,39 @@ class MemoryEngine:
         entries = [MemoryEntry.from_dict(e) for e in memory]
         conflicts = find_all_conflicts(entries)
 
-        # Apply conflict status (append-only relations)
-        for c in conflicts:
-            self.updater.mark_conflict(memory, c.entry_a, c.entry_b)
-
         existing = self._read_conflicts()
         existing_keys = {(c.get("entry_a"), c.get("entry_b")) for c in existing}
+        fresh = [
+            c for c in conflicts
+            if (c.entry_a, c.entry_b) not in existing_keys
+            and (c.entry_b, c.entry_a) not in existing_keys
+        ]
+        # Cap the burst: strongest evidence first, the rest are dropped (they
+        # will resurface on a later scan if they still matter).
+        fresh.sort(key=lambda c: float(getattr(c, "similarity", 0.0)), reverse=True)
+        dropped = max(0, len(fresh) - self._MAX_NEW_CONFLICTS_PER_SCAN)
+        fresh = fresh[: self._MAX_NEW_CONFLICTS_PER_SCAN]
+
+        # Apply conflict status only for conflicts we actually record — marking
+        # entries for dropped records would strand them as orphans.
+        recorded_keys = {(c.entry_a, c.entry_b) for c in fresh} | existing_keys
         for c in conflicts:
-            key = (c.entry_a, c.entry_b)
-            if key not in existing_keys and (c.entry_b, c.entry_a) not in existing_keys:
-                existing.append(c.to_dict())
+            if (c.entry_a, c.entry_b) in recorded_keys or (c.entry_b, c.entry_a) in recorded_keys:
+                self.updater.mark_conflict(memory, c.entry_a, c.entry_b)
+
+        for c in fresh:
+            existing.append(c.to_dict())
 
         self.storage.write(MEMORY_FILE, memory)
         self.storage.write(CONFLICTS_FILE, existing)
 
         self._log(
             action="detect_conflicts",
-            affected=[c.entry_a for c in conflicts] + [c.entry_b for c in conflicts],
-            reason=f"full scan; {len(conflicts)} conflict(s) total",
+            affected=[c.entry_a for c in fresh] + [c.entry_b for c in fresh],
+            reason="full scan; {} new conflict(s) recorded{}".format(
+                len(fresh),
+                f", {dropped} weaker one(s) dropped by burst cap" if dropped else "",
+            ),
         )
         return [c.to_dict() for c in conflicts]
 
@@ -915,7 +1017,12 @@ class MemoryEngine:
             score = sem_score * 0.9 + conf_factor * 0.1
             scored.append((score, e))
 
-        scored.sort(key=lambda x: x[0], reverse=True)
+        # Recency tiebreak: entries tied on score (common at the confidence
+        # floor) rank by freshest use/write instead of arbitrary list order.
+        scored.sort(
+            key=lambda x: (x[0], x[1].get("last_used") or x[1].get("timestamp") or ""),
+            reverse=True,
+        )
         top = scored[:top_k]
 
         file_summaries = self._get_file_summaries()

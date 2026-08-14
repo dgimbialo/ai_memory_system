@@ -73,6 +73,13 @@ DAYS_PER_EVENT: float = 3.0
 # Audit finding: all 13 piobmasterpro decisions had sunk to the 0.25 floor.
 DECISION_HALF_LIFE_MULT: float = 4.0
 
+# Every confirmed use of a memory extends its half-life by this fraction:
+# hl_eff = hl * (1 + USAGE_HALF_LIFE_BONUS * usage_count). A one-off +delta on
+# reinforce proved too weak against daily decay (audit #2: 30 reinforcements
+# could not stop 72% of a store re-flooring) — proven-useful memories must rot
+# structurally slower, not just start a little higher.
+USAGE_HALF_LIFE_BONUS: float = 0.5
+
 
 def activity_age_days(
     wall_age_days: float,
@@ -148,11 +155,15 @@ def entry_effective_confidence(
       * activity-relative age when ``sorted_timestamps`` (all entries' write
         timestamps, ascending) is provided — otherwise wall-clock age
       * decisions decay DECISION_HALF_LIFE_MULT times slower
+      * each confirmed use extends the half-life (USAGE_HALF_LIFE_BONUS)
     """
     anchor = _anchor_ts(entry)
     hl = half_life_days * (
         DECISION_HALF_LIFE_MULT if entry.get("type") == "decision" else 1.0
     )
+    usage = int(entry.get("usage_count") or 0)
+    if usage > 0:
+        hl *= 1.0 + USAGE_HALF_LIFE_BONUS * usage
 
     age_override: Optional[float] = None
     if sorted_timestamps and anchor:

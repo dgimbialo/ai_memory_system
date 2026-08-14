@@ -184,7 +184,9 @@ TOOLS: List[Dict[str, Any]] = [
 # relevant — auto-reinforce it. This closes the feedback loop that manual
 # memory_confirm never closed in practice (usage_count was 0 across all stores).
 _SESSION_RECALLS: Dict[str, set] = {}
-_AUTO_REINFORCE_DELTA: float = 0.02
+# +0.05 per confirmed reuse (audit #2: +0.02 x 30 events was noise against the
+# daily decay pull). Combined with the usage_count half-life bonus in decay.py.
+_AUTO_REINFORCE_DELTA: float = 0.05
 _AUTO_REINFORCE_MAX_PER_ADD: int = 3
 
 
@@ -322,7 +324,19 @@ def _tool_memory_conflicts(_: Dict[str, Any]) -> str:
 
 def _tool_memory_stats(_: Dict[str, Any]) -> str:
     state = _engine().state()
-    return json.dumps(state, ensure_ascii=False, indent=2)
+    out = json.dumps(state, ensure_ascii=False, indent=2)
+    # Loop-health nudge: a project without the SessionStart hook writes
+    # memories nobody reads. Detect from the client's cwd (best-effort).
+    try:
+        settings = Path.cwd() / ".claude" / "settings.json"
+        hooked = settings.exists() and "context_injector" in settings.read_text(encoding="utf-8")
+        if not hooked:
+            out += ("\n\n💡 This project has no SessionStart memory-injection hook. "
+                    "Run:  python D:\\ai_memory_system\\connect.py  (from the project root) "
+                    "so every new session starts with the project memory loaded.")
+    except Exception:
+        pass
+    return out
 
 
 _DISPATCH = {

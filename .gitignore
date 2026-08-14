@@ -45,6 +45,8 @@ Thumbs.db
 
 .claude/settings.json
 .mcp.json
+.vscode/mcp.json
+data/connected_projects.json
 data/file_summaries.json
 tests/test_revert_detector.py
 tests/test_revert_detector.py

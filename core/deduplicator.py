@@ -70,12 +70,20 @@ class Deduplicator:
     # apply: merge clusters, supersede originals
     # ------------------------------------------------------------------
 
-    def apply(self, dry_run: bool = False) -> Dict[str, Any]:
+    def apply(
+        self,
+        dry_run: bool = False,
+        require_same_files: bool = False,
+    ) -> Dict[str, Any]:
         """Find and merge all duplicate clusters.
 
         Parameters
         ----------
         dry_run : if True, compute clusters but do NOT write anything.
+        require_same_files : only merge clusters whose members all touch the
+            exact same file set. Used by the unattended daily auto-dedup —
+            textual similarity alone is not enough evidence to merge without
+            a human looking on.
 
         Returns
         -------
@@ -83,6 +91,11 @@ class Deduplicator:
             clusters_found, merged_count, superseded_count, dry_run, cluster_details
         """
         clusters = self.find_clusters()
+        if require_same_files:
+            clusters = [
+                cl for cl in clusters
+                if len({tuple(sorted(e.get("files") or [])) for e in cl}) == 1
+            ]
         if not clusters:
             return {
                 "clusters_found": 0,

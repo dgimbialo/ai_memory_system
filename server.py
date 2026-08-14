@@ -497,7 +497,8 @@ class MemoryHandler(BaseHTTPRequestHandler):
             log = eng.storage.read("activity_log.json", default=[])
             for a in (log if isinstance(log, list) else []):
                 action = (a.get("action") or "").lower()
-                if "query" in action or "recent" in action:
+                # inject_context = the SessionStart hook read (primary channel)
+                if "query" in action or "recent" in action or "inject" in action:
                     reads += 1
                 elif action in ("add_memory", "mcp:memory_add"):
                     writes += 1
