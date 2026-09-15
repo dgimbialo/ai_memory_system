@@ -452,14 +452,20 @@ class MemoryHandler(BaseHTTPRequestHandler):
         tag_counts: dict = {}
         conf_buckets = [0] * 10  # 0.0–1.0 in tenths
 
+        archived_count = 0
         for e in memory:
             t = e.get("type", "note")
             by_type[t] = by_type.get(t, 0) + 1
             s = e.get("status", "active")
             by_status[s] = by_status.get(s, 0) + 1
-            conf = float(e.get("confidence") or 0.5)
-            total_conf += conf
-            conf_buckets[min(int(conf * 10), 9)] += 1
+            # Archived entries (floor + long-unused) are excluded from the
+            # confidence picture — they'd drag the averages into meaninglessness.
+            if "archived" in (e.get("tags") or []):
+                archived_count += 1
+            else:
+                conf = float(e.get("confidence") or 0.5)
+                total_conf += conf
+                conf_buckets[min(int(conf * 10), 9)] += 1
             date = (e.get("timestamp") or "")[:10]
             if date:
                 by_date[date] = by_date.get(date, 0) + 1
@@ -470,7 +476,8 @@ class MemoryHandler(BaseHTTPRequestHandler):
                     tag_counts[tag] = tag_counts.get(tag, 0) + 1
 
         n = len(memory)
-        avg_conf = round(total_conf / n, 3) if n else 0.0
+        n_scored = n - archived_count
+        avg_conf = round(total_conf / n_scored, 3) if n_scored else 0.0
 
         today = datetime.now(timezone.utc).date()
         entries_per_day = [
@@ -518,6 +525,7 @@ class MemoryHandler(BaseHTTPRequestHandler):
             "linked_entries":        linked,
             "reads":                 reads,
             "writes":                writes,
+            "archived":              archived_count,
         })
 
     def _api_get_settings(self, project):

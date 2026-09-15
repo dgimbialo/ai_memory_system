@@ -209,6 +209,12 @@ def _tool_memory_query(args: Dict[str, Any]) -> str:
         files = {f.lower() for f in (r.get("files") or [])}
         if files:
             _SESSION_RECALLS[r["id"]] = files
+    # Reads also keep the store healthy — maintenance must not freeze in
+    # read-only phases (all hooks are daily-guarded, so this is cheap).
+    try:
+        eng.run_daily_maintenance()
+    except Exception:
+        pass
     lines = [f"Top {len(results)} memories for: {query!r}\n"]
     for r in results:
         tags = ", ".join(r.get("tags", []))
@@ -240,6 +246,9 @@ def _tool_memory_add(args: Dict[str, Any]) -> str:
     msg = f"✅ Saved memory {entry.get('id', '?')} ({entry.get('type')})."
     if result.get("revert_warning"):
         msg += "\n⚠ " + result["revert_warning"].get("message", "Revert pattern detected.")
+    for m in result.get("auto_merged") or []:
+        msg += (f"\n🔀 Near-duplicate of an existing memory — merged into "
+                f"{m.get('merged_entry_id', '?')[:8]} (both originals superseded).")
 
     # Auto-reinforce recalled memories whose surface the agent just re-edited:
     # the recall demonstrably informed real work, which is the strongest

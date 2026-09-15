@@ -115,16 +115,34 @@ def _connect_claude_code(project: Path, python_exe: str, slug: str) -> List[str]
     hook_cmd = f'"{python_exe}" "{injector}" --project {slug} --format plain'
 
     hooks = settings.setdefault("hooks", {})
-    session_start = hooks.setdefault("SessionStart", [])
-    already = any(
-        h.get("command") == hook_cmd
-        for grp in session_start if isinstance(grp, dict)
-        for h in grp.get("hooks", []) if isinstance(h, dict)
-    )
-    if not already:
-        session_start.append({"hooks": [{"type": "command", "command": hook_cmd}]})
+
+    def _ensure_hook(event: str, cmd: str) -> bool:
+        groups = hooks.setdefault(event, [])
+        present = any(
+            h.get("command") == cmd
+            for grp in groups if isinstance(grp, dict)
+            for h in grp.get("hooks", []) if isinstance(h, dict)
+        )
+        if not present:
+            groups.append({"hooks": [{"type": "command", "command": cmd}]})
+        return not present
+
+    added_session = _ensure_hook("SessionStart", hook_cmd)
+
+    # Per-prompt recall: surfaces the 1-3 memories relevant to each prompt.
+    # Lightweight keyword scorer (no model load) — safe to run on every prompt.
+    recall = ROOT / "core" / "prompt_recall.py"
+    recall_cmd = f'"{python_exe}" "{recall}" --project {slug}'
+    added_recall = _ensure_hook("UserPromptSubmit", recall_cmd)
+
+    if added_session or added_recall:
         _write_json(settings_path, settings)
-        results.append(f"Claude hook  → {settings_path}  (SessionStart memory injection)")
+        parts = []
+        if added_session:
+            parts.append("SessionStart injection")
+        if added_recall:
+            parts.append("per-prompt recall")
+        results.append(f"Claude hook  → {settings_path}  (added: {', '.join(parts)})")
     else:
         results.append(f"Claude hook  → {settings_path}  (already configured)")
 

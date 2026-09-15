@@ -6,6 +6,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -49,7 +50,17 @@ class Storage:
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)
-                os.replace(tmp_path, target)
+                # On Windows os.replace fails with PermissionError while any
+                # reader (dashboard server, antivirus scan) briefly holds the
+                # target open. Retry a few times before giving up.
+                for attempt in range(5):
+                    try:
+                        os.replace(tmp_path, target)
+                        break
+                    except PermissionError:
+                        if attempt == 4:
+                            raise
+                        time.sleep(0.05 * (attempt + 1))
             except Exception:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)

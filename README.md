@@ -1,8 +1,8 @@
 # AI Memory System
 
-A self-contained, local persistent memory engine for software projects, built for VS Code + GitHub Copilot Agent workflows — with a beautiful, responsive web dashboard and universal MCP integration for Claude Code, Cursor, VS Code, and Visual Studio.
+A self-contained, local persistent memory engine for software projects — with universal MCP integration for Claude Code, Cursor, VS Code and Visual Studio, SessionStart context injection for both Claude Code and GitHub Copilot Agent, and a responsive web dashboard.
 
-It remembers decisions, tracks bugs and features, detects contradictions between historical entries, renders a structured Markdown wiki, visualises dependency graphs, and automatically feeds that knowledge back into every AI agent session so the agent always has full project context without any manual #file references. Real-time activity logging with SSE streaming shows all incoming commands (HTTP, MCP, CLI) as they happen.
+It remembers decisions, tracks bugs and features, detects contradictions between historical entries, renders a structured Markdown wiki, visualises dependency graphs, and automatically feeds that knowledge back into every AI agent session so the agent always has full project context without any manual #file references. The memory maintains itself: confidence decays with project activity, proven-useful entries are reinforced and age slower, churn-prone code gets flagged, stale conflicts are auto-triaged, and duplicates are merged daily. Real-time activity logging with SSE streaming shows all incoming commands (HTTP, MCP, CLI) as they happen.
 
 ## Why does this exist?
 
@@ -26,55 +26,75 @@ AI agents start every new chat session with a **blank slate** — no memory of d
 ## How It Works
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  VS Code  (Agent mode)                                      │
-│                                                             │
-│  SessionStart hook ──► context_injector.py                  │
-│      └─ injects project memory summary as systemMessage     │
-│                                                             │
-│  Agent edits a file                                         │
-│  PostToolUse hook  ──► hook_handler.py                      │
-│      └─ auto-saves entry to memory + re-renders wiki        │
-│                                                             │
-│  copilot-instructions.md                                    │
-│      └─ tells agent to run add_memory after every edit      │
-└─────────────────────────────────────────────────────────────┘
-         ▼
-   data/projects/<name>/memory.json   (per-project, isolated)
-   data/projects/<name>/wiki/         (Markdown wiki)
+┌──────────────────────────────────┐  ┌──────────────────────────────────────┐
+│  VS Code (Copilot Agent mode)    │  │  Claude Code / Cursor / VS 2022+     │
+│                                  │  │                                      │
+│  SessionStart hook               │  │  mcp_server.py (stdio JSON-RPC 2.0)  │
+│    └─► context_injector.py       │  │    7 tools: memory_query, memory_add,│
+│        injects memory summary    │  │    memory_confirm, memory_reject,    │
+│                                  │  │    memory_recent, memory_conflicts,  │
+│  PostToolUse hook                │  │    memory_stats                      │
+│    └─► hook_handler.py           │  │                                      │
+│        auto-saves memory entry   │  │  .claude SessionStart hook           │
+│                                  │  │    └─► context_injector.py --plain   │
+│  copilot-instructions.md         │  │        injects memory summary        │
+│    └─ instructs agent to record  │  │  /mem* global slash commands         │
+└───────────────┬──────────────────┘  └───────────────────┬──────────────────┘
+                ▼                                         ▼
+        MemoryEngine (core/engine.py) — the single gateway for all writes
+        auto-pipeline on every add: conflict detection (capped) · revert
+        detection · auto-tagging · function extraction · daily decay ·
+        conflict triage · dedup + summary rollup · file summaries · wiki
+                ▼
+        data/projects/<name>/memory.json    (per-project, isolated)
+        data/projects/<name>/wiki/          (Markdown wiki)
 ```
 
-One installation at `C:\ai_memory_system` serves **all** your projects — each with isolated data under `data/projects/<name>/`.
+One installation (e.g. `D:\ai_memory_system`) serves **all** your projects — each with isolated data under `data/projects/<name>/`. The registry `data/connected_projects.json` remembers every connected project so `connect.py --all` can refresh hooks and configs everywhere at once.
 
 ## Features
 
-- **SessionStart hook** — injects full project memory into every Copilot Agent session automatically
-- **PostToolUse hook** — deterministically records a memory entry after every file write
+### Capture & recall
+- **SessionStart injection** — a relevance-first memory summary (key decisions → high-confidence entries → unstable surfaces → recent activity → open conflicts) is injected into every new agent session, both in VS Code Copilot and in Claude Code; every injection is logged as a *read* so the read/write balance is measurable
+- **PostToolUse hook** (VS Code) — deterministically records a memory entry after every file write
+- **MCP server** — 7 tools (`memory_query/add/confirm/reject/recent/conflicts/stats`) over stdio JSON-RPC 2.0 for Claude Code, Cursor, VS Code, VS 2022/2026
+- **Slash commands** — 15 global `/mem*` commands available in any Claude Code chat
+- **Semantic search** — query ranking blends 90% semantic similarity with 10% decayed confidence; ties break by recency
+
+### Trust economy (confidence lifecycle)
+- **Type-aware birth confidence** — decision `0.75`, bug_fix/feature `0.60`, note `0.45` (explicit values always respected)
+- **Activity-relative decay** — effective age = `min(wall-clock age, newer entries × 3 days)`: a paused project's memory does not rot; half-life 60 days, floor `0.25`, 7-day grace period
+- **Decisions age 4× slower** — a decision holds until it is superseded
+- **Reinforcement loop** — `memory_confirm`/`memory_reject` raise/lower confidence; the MCP server *auto-reinforces* recalled entries whose files the agent then re-edited (+0.05, the strongest relevance signal available without asking anyone)
+- **Usage extends half-life** — `hl_eff = hl × (1 + 0.5 × usage_count)`: proven-useful memories structurally rot slower
+- **No compounding** — decay always recomputes from an immutable `confidence_base`, never from an already-decayed value
+
+### Self-maintenance (all automatic, piggy-backed on `add_memory`)
+- **Conflict detection** — semantic similarity + heuristics with hot-file discount; burst-capped (max 10 new conflicts per full scan, 3 per single add); full scan every 15 active entries
+- **Conflict auto-triage** — stale disputes are auto-dismissed (30+ days with both sides at the floor, or 14+ days when both ≤ 0.35), restoring the entries to `active`; manual `supersede`/`merge`/`dismiss` always available with a full audit trail
+- **Orphan healing** — entries stuck in `conflict` status without a matching record are restored to `active`
+- **Revert detection (v2)** — flags add/revert churn as `unstable` (×0.85 confidence penalty, floor `0.25`); function-level surface matching with auto-extraction of function names from prose; hotspot guard (many edits ≠ churn) and small-project guard (< 8 distinct files → file overlap carries no signal); the detector is versioned, so algorithm upgrades re-evaluate old tags automatically, and tags expire after 14 quiet days
+- **Daily hygiene** — conservative dedup (similarity ≥ 0.97 **and** identical file sets) plus rollup of old session summaries (newest 5 kept)
+- **Daily decay** — runs at most once per day per project; operational timestamps survive wiki rebuilds
+- **Auto-tagging & function extraction** — keywords and `name()` patterns harvested from description/cause/fix
+- **Auto file summaries** — per-file digest regenerated on every `add_memory`
+
+### Storage & integrity
 - **Append-first storage** — historical entries are never silently overwritten
 - **Atomic JSON writes** with automatic backup before overwrite
-- **Conflict detection + resolution** — semantic similarity + heuristics; `supersede`, `merge`, `dismiss` actions with full audit trail; hot-file discount suppresses false positives on frequently-edited files
-- **Orphan healing** — entries stuck in `conflict` status but with no matching conflict record are automatically restored to `active`
-- **Revert detection** — identifies repeated revert patterns; newly `unstable`-tagged entries receive a `×0.85` confidence penalty (floor `0.40`)
-- **Confidence decay** — time-based decay (configurable half-life) with preview mode; auto-scheduled once per day via the `add_memory` hook
-- **Semantic deduplication** — near-duplicate detection and merge with threshold control
+- **Activity log** — every change timestamped with action, affected IDs and reason
+- **Test-ID links** — warns when superseding entries that have linked tests
+- **Git stale check** — flags entries whose referenced files/functions no longer exist in the repo
 - **Dependency graph** — `depends_on` / `required_by` links; cycle detection; semantic link suggestions
-- **Auto-tagging** — keywords in `description`/`cause`/`fix` are matched against a configurable tag dictionary and applied automatically on `add_memory`
-- **Auto conflict scan** — `detect_conflicts()` runs automatically every 15 active entries
-- **Wiki dirty-check** — `render_wiki` is a no-op when no entries have changed since the last render
-- **Auto file summaries** — per-file digest regenerated on every `add_memory`
-- **Test-ID links** — attach test identifiers to entries; warns when superseded entries have linked tests
-- **Git stale check** — cross-checks entries against git history to flag outdated knowledge
-- **Markdown wiki** auto-rendered with Obsidian-friendly `[[wikilinks]]`: by type, file, status
-- **HTML dashboard** — local web UI with charts, vis.js dependency graph, settings form, operations panel, i18n (EN/UK)
-- **Real-time log viewer** — SSE-driven Live Log tab shows all incoming commands (HTTP, MCP, CLI) with filtering, detail drawer, export
-- **MCP server** — universal Model Context Protocol integration for Claude Code, Cursor, VS Code, VS 2022/2026
-- **Slash commands** — `/mem*` commands in Claude Code agent chat (query, add, recent, conflicts, stats, decay, etc.)
-- **One-command IDE setup** — `connect.py` wires the system into any IDE with a single command
-- **Activity log** — every change timestamped with action and reason
-- **Learner** — analyses Copilot chat logs, extracts patterns, updates all managed project instructions
+
+### Interfaces
+- **HTML dashboard** — local web UI with charts, vis.js dependency graph, real-time SSE log, settings form, operations panel, i18n (EN/UK)
+- **Markdown wiki** auto-rendered with Obsidian-friendly `[[wikilinks]]`, dirty-checked (no-op when nothing changed)
+- **One-command IDE setup** — `connect.py` wires MCP configs + hooks into any IDE; `connect.py --all` refreshes every registered project at once
+- **Learner** — analyses Copilot chat logs, extracts patterns, updates managed project instructions
 - **Daemon** — background file watcher for non-agent edits (fallback)
-- **Multi-project** — `--project name` flag isolates data per project
-- **Offline-first embeddings** — uses `sentence-transformers` when installed, falls back to a deterministic local hasher
+- **Multi-project** — data isolated per project under `data/projects/<slug>/`
+- **Offline-first embeddings** — `sentence-transformers` when installed, deterministic local hasher otherwise; LRU-cached
 
 ---
 
@@ -95,8 +115,8 @@ pip install watchdog                # efficient file watching (daemon mode)
 ## Installation
 
 ```powershell
-git clone https://github.com/your-username/ai-memory-system.git C:\ai_memory_system
-cd C:\ai_memory_system
+git clone https://github.com/dgimbialo/ai_memory_system.git D:\ai_memory_system
+cd D:\ai_memory_system
 
 # (Optional) create venv
 python -m venv .venv ; .venv\Scripts\Activate.ps1
@@ -149,20 +169,30 @@ python run.py --project my_app lint
 | Command | Description |
 |---|---|
 | `add_memory` | Add entry (`--type`, `--description`, `--cause`, `--fix`, `--files`, `--confidence`, `--tags`, `--depends-on`, `--test-ids`) |
+| `session_summary` | Create one summary entry aggregating recent session work (old summaries auto-roll up, newest 5 kept) |
 | `list_memory` | List entries (filter: `--type`, `--status`) |
-| `query_memory` | Top-k semantic search |
+| `query_memory` | Top-k semantic search (decay-aware ranking, recency tiebreak) |
 | `update_status` | Change entry status (logged) |
-| `update_confidence` | Change entry confidence (logged) |
-| `detect_conflicts` | Full conflict re-scan |
+| `update_confidence` | Change entry confidence (logged; also resets the decay baseline) |
+| `reinforce` | Confirm a memory: raise confidence, count the use, reset the decay clock |
+| `weaken` | Reject a memory: lower confidence toward the floor |
+| `detect_conflicts` | Full conflict re-scan (burst-capped at 10 new conflicts per scan) |
+| `list_conflicts` | List unresolved conflicts with full entry details |
 | `resolve_conflict` | Resolve conflict: `--id`, `--action supersede_a\|supersede_b\|merge\|dismiss`, `--reason` |
-| `decay` | Apply time-based confidence decay (`--half-life-days`, `--min-confidence`, `--dry-run` / `--apply`) |
+| `triage_conflicts` | Auto-dismiss stale conflicts (old + both sides decayed; `--max-age-days`, `--dry-run` / `--apply`) |
+| `decay` | Apply confidence decay (`--half-life-days`, `--min-confidence`, `--dry-run` / `--apply`) |
+| `decay_preview` | Read-only preview of effective (decayed) confidence for all entries |
 | `deduplicate` | Find and merge near-duplicates (`--threshold`, `--dry-run` / `--apply`) |
+| `find_duplicates` | List duplicate clusters (read-only alias for `deduplicate --dry-run`) |
+| `stabilize_unstable` | Remove `unstable` tags from surfaces with no revert activity for N days |
+| `recompute_unstable` | Re-evaluate all `unstable` tags with the current detector, clear stale ones |
 | `add_link` | Create a `depends_on` link (`--from-id`, `--to-id`) |
 | `remove_link` | Remove a dependency link |
 | `get_dependencies` | Show transitive dependencies (`--id`, `--depth`) |
 | `suggest_links` | Suggest links by semantic similarity (`--id`, `--threshold`, `--top-k`) |
 | `summarize_file` | Print auto-generated file summary |
-| `check_stale` | Cross-check against git history (`--repo-path`, `--min-age-days`, `--dry-run` / `--apply`) |
+| `check_stale` | Flag entries whose referenced files/functions no longer exist in the repo (`--repo-path`, `--dry-run` / `--apply`) |
+| `update_instructions` | Generate Learned Patterns from high-confidence decisions into copilot-instructions.md |
 | `render_wiki` | Render Markdown wiki under `data/…/wiki/` |
 | `lint` | 7 health checks: stale, low-confidence, orphans, duplicates… |
 | `state` | Entry count, conflicts, wiki, embedding backend |
@@ -193,13 +223,33 @@ python server.py --project my_app --port 8080 --no-browser
 
 | Tab | Contents |
 |---|---|
-| **Dashboard** | 8 KPI cards (totals, averages, conflict count) + 6 large Chart.js visualizations: entry types, activity timeline, top files, confidence histogram, top tags, status breakdown. All charts are highly interactive. |
-| **Entries** | Sortable, searchable table with 10+ columns; click any row for expandable detail pane. Inline editing of status, confidence, tags. Bulk operations via toolbar. Export as JSON/CSV. |
-| **Conflicts** | Side-by-side conflict comparison cards with accept/merge/dismiss actions, reason dialog, and full audit trail. Auto-detection and manual resolution both supported. |
-| **Graph** | Interactive vis.js dependency graph — nodes colored by entry type, sized by confidence. Filter by type/tag, pan/zoom, double-click for detail, suggest related entries. |
-| **Files** | File list with per-file entry badges; click to expand auto-summary digest + all related memory entries. Sort by name, entry count, or update time. |
-| **Live Log** | Real-time SSE stream of ALL incoming commands (HTTP, MCP, CLI) with millisecond timestamps. Filter by source/method/project, pause/resume, auto-scroll, click any row for full JSON detail drawer. Export as JSON. |
-| **Settings** | Full configuration form for decay (half-life, floor), deduplication (similarity threshold), auto-tagging keywords, and default top-k results. Operations panel: one-click decay, dedup, wiki render, lint. |
+| **Dashboard** | 9 KPI cards (totals by type, avg confidence, open conflicts, linked entries, active entries, **Reads / Writes** loop-health ratio) + 6 large Chart.js visualizations: entry types, activity timeline, top files, confidence histogram, top tags, status breakdown. |
+| **Entries** | Filterable, searchable table; click any row for an expandable detail pane with inline editing of status, confidence and tags. |
+| **Conflicts** | Side-by-side conflict comparison cards with supersede/merge/dismiss actions, reason dialog, and full audit trail. Auto-detection, auto-triage and manual resolution all supported. |
+| **Graph** | Interactive vis.js dependency graph — nodes colored by entry type, sized by confidence. Filter controls, pan/zoom, detail view, suggest related entries. |
+| **Files** | File list with per-file entry badges; click to expand auto-summary digest + all related memory entries. |
+| **Live Log** | Real-time SSE stream of ALL incoming commands (HTTP, MCP, CLI) with millisecond timestamps. Filter by text/source/method, pause/resume, auto-scroll, click any row for a full JSON detail drawer. Export as JSON. |
+| **Settings** | Configuration form for decay (half-life, floor), deduplication threshold, revert detection, query defaults and default tags. Operations panel: one-click decay, dedup, wiki render, lint. |
+
+The projects dropdown hides empty stores automatically (test artifacts, slug typos); a store reappears with its first entry.
+
+### Screenshots
+
+**Entries** — filterable table with confidence bars, inline editing and detail pane:
+
+![Entries tab](docs/AI_Foto_2.png)
+
+**Conflicts** — side-by-side comparison with one-click resolution:
+
+![Conflicts tab](docs/AI_Foto_3.png)
+
+**Live Log** — real-time SSE stream of every incoming command, with a JSON detail drawer:
+
+![Live Log tab](docs/AI_Foto_4.png)
+
+**Settings** — full configuration form plus one-click operations panel:
+
+![Settings tab](docs/AI_Foto_5.png)
 
 Language switcher (EN / UK) in the top-right corner — strings sourced from `ui/translations.js`.
 
@@ -229,20 +279,33 @@ The system exposes a universal **Model Context Protocol (MCP)** server that work
 
 ```powershell
 cd C:\Path\To\Your\Project
-python C:\ai_memory_system\connect.py
+python D:\ai_memory_system\connect.py
 
-# Or force specific IDE(s):
-python C:\ai_memory_system\connect.py --ide claude cursor vscode vs
+# Force specific IDE(s):
+python D:\ai_memory_system\connect.py --ide claude --ide vs
+
+# Refresh hooks/configs for EVERY previously connected project:
+python D:\ai_memory_system\connect.py --all
 ```
 
 This creates/updates:
-- `.mcp.json` — Claude Code, VS 2022/2026 config (both `mcpServers` and `servers` keys)
+- `.mcp.json` — Claude Code + VS 2022/2026 config (both `mcpServers` and `servers` keys)
+- `.claude/settings.json` — Claude Code **SessionStart hook** (memory summary injected into every new session)
 - `.cursor/mcp.json` — Cursor config
 - `.vscode/mcp.json` — VS Code config
 - `%APPDATA%\Microsoft\VisualStudio\globalMcpServers.json` — VS global config (applies to all solutions)
 - `.github/copilot-instructions.md` — Copilot Chat context with memory workflow
 
+Every connect registers the project in `data/connected_projects.json`, so a later `connect.py --all` upgrades all of them in one go. All config writes are merges — idempotent and safe to re-run.
+
 Then **reload your IDE** — the agent now has 7 memory tools available.
+
+### The feedback loop, closed automatically
+
+- Every `memory_query` resets the decay clock of the entries it surfaced (`last_used`)
+- When the agent later saves a memory whose files overlap a previously recalled entry, that entry is **auto-reinforced** (+0.05): recall that demonstrably informed real work is the strongest relevance signal there is
+- A `bug_fix` saved without a root cause gets a gentle nudge in the tool response — the cause is what makes the memory valuable when the bug resurfaces
+- `memory_stats` warns when the current project lacks the SessionStart hook
 
 ### MCP Tools (Slash Commands in Claude Code)
 
@@ -267,6 +330,10 @@ Inside any agent chat, use these slash commands:
 | `/memsession` | Create a session summary |
 
 All commands work **offline** — no external APIs, pure local Python + embeddings.
+
+The `/mem*` commands autocomplete right in the Claude Code chat:
+
+![Slash commands in Claude Code](docs/AI_Foto_6.png)
 
 **Example**: Ask the agent to "check project memory for async patterns" and it will automatically call `/mem async patterns`, surface relevant past decisions, and use that context for the current task.
 
@@ -299,15 +366,22 @@ Creates inside `C:\Projects\MyApp`:
 
 **`SessionStart`** → `core/context_injector.py`
 
-At the start of every agent session, the agent receives:
+At the start of every agent session (VS Code hook protocol, or `--format plain` for the Claude Code hook), the agent receives a relevance-first summary — durable knowledge before recency:
 ```
-## Project Memory — my_app  (2026-04-28 17:31 UTC)
-### Recent Active Entries (5 total)
-- [abc12345] (bug_fix, conf=0.90) Login crashes on empty password → src/auth.py [2026-04-10]
+## Project Memory — my_app  (2026-09-15 10:08 UTC)
+### Key Decisions
+- [aa11bb22] (decision, conf=0.75, active) Use PostgreSQL for the primary store → db/schema.sql [2026-08-02]
+### High-Confidence Memories
+- [abc12345] (bug_fix, conf=0.90, active) Login crashes on empty password → src/auth.py [2026-09-10]
+### ⚠ Unstable / Churn-Prone (avoid re-litigating)
+- attachGraceNotes  (3 add/revert-tagged entries)
+### Recent Activity
+- [ff00aa11] (feature, conf=0.60, active) Add rate limiting to login endpoint → src/auth.py [2026-09-14]
 ### Open Conflicts (1)
 - abc12345 ↔ def67890  sim=0.92  duplicate unresolved issue
-### Stats  total=12  bug_fix=4  feature=5  decision=3
+### Stats  total=12  active=11  bug_fix=4  feature=5  decision=3
 ```
+Each injection is also written to the activity log as an `inject_context` read event.
 
 **`PostToolUse`** → `core/hook_handler.py`
 
@@ -381,17 +455,20 @@ ai_memory_system/
 │   ├── log.js                # real-time SSE log viewer (Live Log tab)
 │   └── translations.js       # EN/UK i18n strings
 ├── docs/
-│   └── screenshot.png        # dashboard screenshot
-├── data/                     # ← gitignored; created by bootstrap.py
+│   ├── AI_Foto_1.png         # dashboard screenshot
+│   └── INTEGRATION.md        # integration notes
+├── data/                     # ← runtime data, gitignored; created by bootstrap.py
 │   ├── .gitkeep
+│   ├── connected_projects.json  # registry of connected projects (for connect.py --all)
 │   └── projects/             # per-project isolated stores
 │       └── <name>/
 │           ├── memory.json
 │           ├── conflicts.json
-│           ├── activity_log.json
+│           ├── activity_log.json      # audit trail incl. inject_context read events
 │           ├── file_summaries.json
 │           ├── settings.json
-│           └── wiki/
+│           └── wiki/                  # + wiki.json carries operational timestamps
+│                                      #   (last_decay_run, last_hygiene_run, detector version …)
 ├── templates/
 │   └── copilot_instructions.md.tpl
 ├── .github/
@@ -402,18 +479,19 @@ ai_memory_system/
 │       └── record-memory.prompt.md
 ├── .claude/
 │   └── launch.json           # Claude Code preview server config
-├── tests/
+├── tests/                    # 98 tests
 │   ├── test_conflict_resolver.py
-│   ├── test_decay.py
+│   ├── test_decay.py         # incl. activity-relative aging, dormant freeze, usage bonus
 │   ├── test_deduplicator.py
-│   └── test_revert_detector.py
+│   ├── test_pack2.py         # birth-by-type, conflict caps, fast triage, same-files dedup
+│   └── test_revert_detector.py  # incl. hotspot + small-project guards
 ├── bootstrap.py              # one-time setup: creates data/ structure
 ├── run.py                    # memory CLI (local)
 ├── run_infra.py              # VS Code / Copilot infra CLI
 ├── mem.py                    # universal CLI wrapper (calls run.py, used by /mem* slash commands)
 ├── mcp_server.py             # Model Context Protocol server (stdio JSON-RPC 2.0)
-├── connect.py                # one-command IDE integration (Claude Code, Cursor, VS Code, VS 2022/2026)
-└── server.py                 # local HTML dashboard server
+├── connect.py                # one-command IDE integration + --all registry refresh
+└── server.py                 # local HTML dashboard server (ThreadingHTTPServer + SSE)
 ```
 
 ---
@@ -422,23 +500,31 @@ ai_memory_system/
 
 ```json
 {
-  "id":             "abc123def456",
-  "type":           "bug_fix | feature | note | decision",
-  "description":    "string (required)",
-  "cause":          "what triggered the change",
-  "fix":            "what exactly changed and where",
-  "decisions":      ["list of key decisions made"],
-  "files":          ["relative/path/to/file.py"],
-  "status":         "active | resolved | superseded | conflict",
-  "confidence":     0.9,
-  "timestamp":      "2026-05-18T10:00:00+00:00",
-  "depends_on":     ["other_entry_id"],
-  "required_by":    ["other_entry_id"],
-  "test_ids":       ["test_my_feature"],
-  "conflicts_with": ["other_entry_id"],
-  "tags":           ["agent", "auto", "project:my_app"]
+  "id":              "abc123def456",
+  "type":            "bug_fix | feature | note | decision",
+  "description":     "string (required)",
+  "cause":           "what triggered the change",
+  "fix":             "what exactly changed and where",
+  "decisions":       ["list of key decisions made"],
+  "files":           ["relative/path/to/file.py"],
+  "functions":       ["touched symbols; auto-extracted from prose when omitted"],
+  "status":          "active | resolved | superseded | conflict",
+  "confidence":      0.9,
+  "confidence_base": 0.9,
+  "timestamp":       "2026-05-18T10:00:00+00:00",
+  "usage_count":     0,
+  "last_used":       "",
+  "depends_on":      ["other_entry_id"],
+  "required_by":     ["other_entry_id"],
+  "test_ids":        ["test_my_feature"],
+  "conflicts_with":  ["other_entry_id"],
+  "tags":            ["agent", "auto", "project:my_app"]
 }
 ```
+
+If `confidence` is omitted, it is set by type: decision `0.75`, bug_fix/feature `0.60`, note `0.45`.
+`confidence_base` is the immutable decay baseline (decay never compounds from an already-decayed value);
+`usage_count` and `last_used` power the reinforcement loop: reuse resets the decay clock and extends the half-life.
 
 ---
 
@@ -476,17 +562,24 @@ result = engine.add_memory({
 # result["created_links"]   → dependency links created
 # result["suggested_links"] → similar entries worth linking
 
+# Reinforcement loop
+engine.reinforce(entry_id, reason="recalled entry proved correct")   # ↑ confidence, ↑ usage_count
+engine.weaken(entry_id, reason="entry misled the agent")             # ↓ confidence toward the 0.25 floor
+engine.touch_used([id1, id2])                                        # reset decay clocks after a recall
+
 # Conflict resolution
 engine.resolve_conflict(conflict_id, action="supersede_a", reason="B is the correct fix")
+engine.triage_conflicts(dry_run=True)      # preview auto-dismissal of stale conflicts
 
 # Dependency graph
 engine.add_dependency_link(from_id, to_id)
 engine.get_dependencies(entry_id, depth=2)
 engine.suggest_links(entry_id, threshold=0.75, top_k=5)
 
-# Maintenance operations
-engine.decay(dry_run=True, half_life_days=60, min_confidence=0.4)
+# Maintenance operations (all also run automatically via add_memory hooks)
+engine.decay(dry_run=True, half_life_days=60, min_confidence=0.25)
 engine.deduplicate(dry_run=True, threshold=0.88)
+engine.recompute_unstable(dry_run=True)    # replay revert detection with the current algorithm
 engine.check_stale(repo_path="C:/Projects/MyApp", min_age_days=7)
 engine.render_wiki_md()
 ```
@@ -496,7 +589,7 @@ engine.render_wiki_md()
 ### Українська (Ukrainian)
 
 ## Огляд
-AI Memory System — локальний рушій персистентної пам'яті для програмних проектів. Система запам'ятовує рішення, отримує записи про помилки та функції, виявляє суперечності та автоматично надає повний контекст проекту кожній сесії GitHub Copilot Agent в VS Code.
+AI Memory System — локальна система постійної пам'яті для програмних(і будь яких інших) проектів. Система запам'ятовує рішення, баги та функції, виявляє суперечності, сама підтримує якість своїх даних (розпад, підкріплення, автоматичне відсіювання застарілих конфліктів та обережне об'єднання дублікатів) і автоматично надає контекст проекту кожній сесії AI-агента: Claude Code, Cursor, VS Code Copilot та Visual Studio.
 
 ## Навіщо це потрібно?
 AI-агенти починають кожну нову сесію з **чистого аркуша** — без жодної пам'яті про попередні рішення, виправлені баги чи причини, чому код виглядає саме так. Вирішуючи нову задачу, агенти регулярно ламають рішення, які були ретельно побудовані в попередніх сесіях.
@@ -512,14 +605,18 @@ AI-агенти починають кожну нову сесію з **чист�
 
 ### Ключові можливості (Key Features)
 
-- **SessionStart hook** — інжектує повну пам'ять проекту в кожну сесію GitHub Copilot Agent автоматично
+- **SessionStart інжекція** — стислий підсумок пам'яті (рішення → найдостовірніші записи → нестабільні місця → нещодавнє → конфлікти) автоматично вставляється в кожну нову сесію: і в VS Code Copilot, і в Claude Code; кожна інжекція логується як *читання*
 - **PostToolUse hook** — детерміністично записує запис пам'яті після кожного запису файлу
 - **Append-first storage** — історичні записи ніколи не перезаписуються мовчки
 - **Атомарні JSON записи** з автоматичним резервним копіюванням перед перезаписом
-- **Виявлення та розв'язання конфліктів** — семантична схожість + евристики; знижка для "гарячих" файлів (частих файлів); дії `supersede`, `merge`, `dismiss` з повною аудит-стежкою
+- **Економіка довіри** — впевненість при народженні залежить від типу (decision `0.75`, bug_fix/feature `0.60`, note `0.45`); розпад рахується відносно активності проекту (пауза не "гноїть" пам'ять); рішення старіють у 4 рази повільніше; підтверджене використання продовжує half-life; розпад завжди від незмінної бази — без накопичувального ефекту
+- **Цикл підкріплення** — `memory_confirm`/`memory_reject` піднімають/знижують впевненість; MCP-сервер автоматично підкріплює (+0.05) згадані записи, чиї файли агент потім редагував
+- **Виявлення та розв'язання конфліктів** — семантична схожість + евристики; знижка для "гарячих" файлів; ліміти на сплески (макс. 10 нових конфліктів за скан, 3 за одне додавання); дії `supersede`, `merge`, `dismiss` з повною аудит-стежкою
+- **Авто-тріаж конфліктів** — застарілі суперечки (30+ днів на floor, або 14+ днів при обох сторонах ≤0.35) закриваються автоматично, записи повертаються в `active`
 - **Зцілення сиріт** — записи зі статусом `conflict` без відповідного запису конфлікту автоматично відновлюються до `active`
-- **Виявлення повернень** — ідентифікує повторювані паттерни; новоозначені `unstable` записи отримують штраф `×0.85` до впевненості (мінімум `0.40`)
-- **Розпад впевненості** — часовий розпад з режимом попереднього перегляду; автоматичне планування раз на день через хук `add_memory`
+- **Виявлення повернень (v2)** — ідентифікує add/revert цикли на рівні функцій (авто-екстракція імен функцій з тексту); захист від хибних спрацювань на гарячих файлах та малих проектах (<8 файлів); тег `unstable` дає штраф `×0.85` (мінімум `0.25`), сам знімається після 14 тихих днів; детектор версіонований — оновлення алгоритму автоматично переоцінює старі теги
+- **Розпад впевненості** — щоденний автоматичний запуск через хук `add_memory`; half-life 60 днів, floor `0.25`, 7 днів grace-періоду
+- **Щоденна гігієна** — консервативний дедуп (схожість ≥0.97 **та** однакові файли) + згортання старих session summaries (лишаються 5 найновіших)
 - **Семантична дедублікація** — виявлення та об'єднання майже-дублів з контролем порогу
 - **Автоматичне тегування** — ключові слова з `description`/`cause`/`fix` зіставляються зі словником тегів і застосовуються автоматично
 - **Авто-сканування конфліктів** — `detect_conflicts()` запускається автоматично кожні 15 активних записів
@@ -543,8 +640,8 @@ AI-агенти починають кожну нову сесію з **чист�
 ### Встановлення (Installation)
 
 ```bash
-git clone https://github.com/your-org/ai_memory_system.git C:\ai_memory_system
-cd C:\ai_memory_system
+git clone https://github.com/dgimbialo/ai_memory_system.git D:\ai_memory_system
+cd D:\ai_memory_system
 python bootstrap.py
 ```
 
@@ -600,10 +697,14 @@ data/projects/my_app/
   "description":    "обов'язковий текст",
   "cause":          "що спричинило зміну",
   "fix":            "що саме змінилось та де",
-  "files":          ["відносна/стежка/до/файлу.py"],
-  "status":         "active | resolved | superseded",
+  "files":          ["відносний/шлях/до/файлу.py"],
+  "functions":      ["зачеплені функції; авто-екстракція з тексту, якщо не вказано"],
+  "status":         "active | resolved | superseded | conflict",
   "confidence":     0.9,
+  "confidence_base": 0.9,
   "timestamp":      "2026-05-18T10:00:00+00:00",
+  "usage_count":    0,
+  "last_used":      "",
   "depends_on":     ["інший_id_запису"],
   "test_ids":       ["test_мої_функції"],
   "tags":           ["agent", "auto"]
@@ -615,37 +716,42 @@ data/projects/my_app/
 ```bash
 # Керування записами
 python run.py --project <name> add_memory        # додати запис
-python run.py --project <name> list_entries      # список записів
+python run.py --project <name> list_memory       # список записів
+python run.py --project <name> query_memory "..."  # семантичний пошук
 python run.py --project <name> list_conflicts    # список конфліктів
+python run.py --project <name> reinforce <id>    # підтвердити запис (впевненість ↑)
+python run.py --project <name> weaken <id>       # відхилити запис (впевненість ↓)
 
 # Граф залежностей
-python run.py --project <name> add_link <from_id> <to_id>
-python run.py --project <name> get_dependencies <id>
-python run.py --project <name> suggest_links <id>
+python run.py --project <name> add_link --from-id <id1> --to-id <id2>
+python run.py --project <name> get_dependencies --id <id>
+python run.py --project <name> suggest_links --id <id>
 
 # Операції обслуговування
-python run.py --project <name> decay             # розпад впевненості
-python run.py --project <name> deduplicate       # виявити дублі
-python run.py --project <name> render_wiki       # регенерувати вікі
+python run.py --project <name> decay --dry-run          # розпад впевненості
+python run.py --project <name> deduplicate --dry-run    # виявити дублі
+python run.py --project <name> triage_conflicts --dry-run  # автоматичне відсіювання застарілих конфліктів
+python run.py --project <name> recompute_unstable --dry-run  # переоцінити unstable-теги
+python run.py --project <name> render_wiki              # регенерувати вікі
 
 # Git перевірка
 python run.py --project <name> check_stale --repo-path /path/to/repo
 
-# Налаштування
-python run.py --project <name> list_settings     # показати параметри
+# Стан сховища
+python run.py --project <name> state             # підсумок: записи, конфлікти, бекенд
 ```
 
 ### Дашбоард (HTML Dashboard)
 
 Запустіть `python server.py` на `localhost:5001` для доступу до веб-інтерфейсу:
 
-- **Dashboard** — KPI карточки та 6 діаграм (типи, часова лінія, файли, впевненість, теги, статус)
-- **Entries** — таблиця записів з фільтруванням та деталями редагування
-- **Conflicts** — карточки конфліктів з діями дозволу конфліктів
+- **Dashboard** — 9 KPI карточок (включно з Reads/Writes - здоров'я циклу читання) та 6 діаграм (типи, часова лінія, файли, впевненість, теги, статус)
+- **Entries** — таблиця записів з фільтруванням та inline-редагуванням статусу/впевненості/тегів
+- **Conflicts** — карточки конфліктів side-by-side з діями розв'язання
 - **Graph** — інтерактивна візуалізація графу залежностей (vis.js)
 - **Files** — список файлів з резюме та записами на файл
-- **Live Log** — синхронна журналізація всіх вхідних команд (HTTP, MCP, CLI) з фільтруванням та деталями
-- **Settings** — форма параметрів + панель операцій (decay, deduplicate, render_wiki)
+- **Live Log** — журнал усіх вхідних команд у реальному часі (HTTP, MCP, CLI) з фільтруванням та JSON-деталями
+- **Settings** — форма параметрів + панель операцій (decay, deduplicate, render_wiki, lint)
 
 ### MCP Інтеграція — Claude Code, Cursor, VS Code, Visual Studio
 
@@ -661,8 +767,13 @@ python run.py --project <name> list_settings     # показати параме
 **Однокомандне налаштування:**
 ```bash
 cd C:\Path\To\Your\Project
-python C:\ai_memory_system\connect.py
+python D:\ai_memory_system\connect.py
+
+# Оновити хуки/конфіги в УСІХ раніше підключених проектах:
+python D:\ai_memory_system\connect.py --all
 ```
+
+Кожне підключення реєструє проект у `data/connected_projects.json`; крім MCP-конфігів, для Claude Code створюється SessionStart-хук (`.claude/settings.json`), який інжектує пам'ять у кожну нову сесію.
 
 Потім перезавантажте IDE — агент матиме доступ до 7 інструментів пам'яті.
 

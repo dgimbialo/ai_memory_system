@@ -108,6 +108,27 @@ _KEYWORD_TAGS: List[tuple] = [
 import re as _re
 
 
+# Durable-knowledge markers: text that signals a fact which holds until
+# explicitly superseded (architecture, root causes, environment constraints,
+# gotchas). Entries matching these get the 'durable' tag and decay as slowly
+# as decisions, regardless of their recorded type.
+_DURABLE_RE = _re.compile(
+    r"(?:\barchitectur\w*\b|\broot caus\w*\b|\bbuild environment\b|"
+    r"\bgotcha\b|\binvariant\b|\bconvention\b|"
+    r"\bis not an? \w{0,20}\s?bug\b|\bnot a bug\b|"
+    r"\bnever use\b|\bonly use\b|\balways use\b|\bdo not use\b|"
+    r"\bmust (?:always|never)\b)",
+    _re.IGNORECASE,
+)
+
+
+def _is_durable_knowledge(entry: "MemoryEntry") -> bool:
+    text = " ".join(filter(None, [
+        entry.description or "", entry.cause or "", entry.fix or "",
+    ]))
+    return bool(_DURABLE_RE.search(text))
+
+
 # Words that look like calls in prose/code snippets but are not project functions.
 _FUNC_STOPWORDS = frozenset({
     "if", "for", "while", "switch", "return", "sizeof", "catch", "assert",
@@ -216,6 +237,12 @@ class MemoryEngine:
     # Cap on conflicts recorded per single add_memory (strongest first).
     _MAX_NEW_CONFLICTS_PER_ADD: int = 3
 
+    # Duplicate-kind conflicts at/above this similarity are merged on the spot
+    # instead of quarantining both entries in status=conflict. Audit #3: nine
+    # sim 0.96-0.99 "duplicate unresolved issue" conflicts held healthy entries
+    # hostage for weeks — a duplicate is a hygiene problem, not a dispute.
+    _AUTO_MERGE_SIM: float = 0.95
+
     # ---------- public API ----------
     def add_memory(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Validate, append, run conflict detection, refresh wiki."""
@@ -256,6 +283,11 @@ class MemoryEngine:
         _auto_funcs = _auto_extract_functions(entry)
         if _auto_funcs:
             entry.functions = _auto_funcs
+
+        # Durable knowledge (architecture facts, root causes, env constraints)
+        # decays as slowly as a decision — see decay.entry_effective_confidence.
+        if "durable" not in entry.tags and _is_durable_knowledge(entry):
+            entry.tags = list(entry.tags) + ["durable"]
 
         memory = self._read_memory()
         existing_entries = [MemoryEntry.from_dict(e) for e in memory]
@@ -354,13 +386,61 @@ class MemoryEngine:
         # Daily hygiene: conservative dedup + session-summary rollup.
         self._maybe_daily_hygiene()
 
+        # Duplicates are merged immediately, not quarantined as conflicts.
+        auto_merged = self._auto_merge_duplicates([c.to_dict() for c in conflicts])
+
         return {
             "entry":           entry.to_dict(),
             "conflicts":       [c.to_dict() for c in conflicts],
             "revert_warning":  revert_warning,
             "created_links":   created_links,
             "suggested_links": suggested_links,
+            "auto_merged":     auto_merged,
         }
+
+    def _auto_merge_duplicates(self, conflict_dicts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Resolve duplicate-kind conflicts (sim >= _AUTO_MERGE_SIM) via merge.
+
+        The merge unions files/functions/decisions/tags, keeps the higher
+        confidence, supersedes both originals and restores the knowledge to
+        one active entry — instead of hiding both sides in status=conflict.
+        Guarded against re-entrancy: the merge itself calls add_memory.
+        """
+        if getattr(self, "_auto_merging", False):
+            return []
+        merged: List[Dict[str, Any]] = []
+        candidates = [
+            c for c in conflict_dicts
+            if "duplicate" in (c.get("reason") or "").lower()
+            and float(c.get("similarity") or 0) >= self._AUTO_MERGE_SIM
+        ]
+        if not candidates:
+            return []
+        self._auto_merging = True
+        try:
+            for c in candidates:
+                try:
+                    r = self.resolve_conflict(
+                        c.get("id", ""),
+                        action="merge",
+                        reason="auto-merge: duplicate (similarity={:.2f})".format(
+                            float(c.get("similarity") or 0)),
+                    )
+                    merged.append({
+                        "conflict_id": c.get("id", ""),
+                        "merged_entry_id": (r.get("merged_entry") or {}).get("id", ""),
+                    })
+                except (KeyError, ValueError):
+                    pass  # already resolved or entries gone — never block add
+        finally:
+            self._auto_merging = False
+        if merged:
+            self._log(
+                "auto_merge_duplicates",
+                [m["merged_entry_id"] for m in merged],
+                "auto-merged {} duplicate conflict(s)".format(len(merged)),
+            )
+        return merged
 
     # ---------- auto conflict detection ----------
 
@@ -598,21 +678,78 @@ class MemoryEngine:
                 dry_run=False, require_same_files=True
             )
             rolled = self._rollup_session_summaries(keep=self._SESSION_SUMMARY_KEEP)
+            archived = self._archive_stale_entries()
 
             wiki_meta = self.storage.read(WIKI_FILE, default={})
             wiki_meta["last_hygiene_run"] = now.isoformat()
             self.storage.write(WIKI_FILE, wiki_meta)
 
             merged = result.get("merged_count", 0)
-            if merged or rolled:
+            if merged or rolled or archived:
                 self._log(
                     "auto_hygiene",
                     [],
                     "daily hygiene: merged {} duplicate cluster(s), rolled up {} "
-                    "old session summar(ies)".format(merged, rolled),
+                    "old session summar(ies), archived {} stale entr(ies)".format(
+                        merged, rolled, archived),
                 )
         except Exception:
             pass  # best-effort
+
+    # Archive: floor-confidence entries untouched for this long leave the
+    # injection and the stats (they stay searchable; a query hit revives them).
+    _ARCHIVE_AFTER_DAYS: float = 30.0
+    _ARCHIVE_CONF_CEILING: float = 0.26
+
+    def _archive_stale_entries(self) -> int:
+        """Tag long-unused floor-confidence entries 'archived'.
+
+        Audit #3: 336 of 413 entries in one store sat undifferentiated at the
+        0.25 floor, dragging stats down and crowding ranking. Archiving keeps
+        them searchable but out of injection and health numbers. Decisions and
+        durable knowledge are never archived; touch_used() lifts the tag the
+        moment a query surfaces an archived entry again.
+        """
+        now = datetime.now(timezone.utc)
+        memory = self._read_memory()
+        archived_ids: List[str] = []
+        for e in memory:
+            if e.get("status") != "active":
+                continue
+            tags = e.get("tags") or []
+            if "archived" in tags or "durable" in tags:
+                continue
+            if e.get("type") == "decision":
+                continue
+            if int(e.get("usage_count") or 0) > 0:
+                continue
+            if float(e.get("confidence") or 0.5) > self._ARCHIVE_CONF_CEILING:
+                continue
+            anchor = e.get("last_used") or e.get("timestamp") or ""
+            try:
+                ts = datetime.fromisoformat(anchor)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if (now - ts).total_seconds() / 86400.0 < self._ARCHIVE_AFTER_DAYS:
+                    continue
+            except (ValueError, TypeError):
+                continue
+            e["tags"] = list(tags) + ["archived"]
+            archived_ids.append(e.get("id", ""))
+        if archived_ids:
+            self.storage.write(MEMORY_FILE, memory)
+        return len(archived_ids)
+
+    def run_daily_maintenance(self) -> None:
+        """Run every daily-guarded maintenance hook. Called from READ paths
+        (MCP query/recent) as well as writes: previously maintenance was
+        piggy-backed only on add_memory, so a project consumed read-only had
+        its decay, triage and hygiene frozen exactly while being used."""
+        self._maybe_auto_decay()
+        self._maybe_auto_stabilize()
+        self._maybe_auto_recompute_unstable()
+        self._maybe_auto_triage_conflicts()
+        self._maybe_daily_hygiene()
 
     # ---------- auto-stabilize (unstable tag removal) ----------
 
@@ -956,6 +1093,10 @@ class MemoryEngine:
                 f", {dropped} weaker one(s) dropped by burst cap" if dropped else "",
             ),
         )
+
+        # Freshly recorded duplicates are merged, not quarantined.
+        self._auto_merge_duplicates([c.to_dict() for c in fresh])
+
         return [c.to_dict() for c in conflicts]
 
     def query_memory(
@@ -1182,6 +1323,10 @@ class MemoryEngine:
         for e in memory:
             if e.get("id") in ids:
                 e["last_used"] = now_iso
+                # Revival: a recalled entry is relevant again — un-archive it.
+                tags = e.get("tags") or []
+                if "archived" in tags:
+                    e["tags"] = [t for t in tags if t != "archived"]
                 n += 1
         if n:
             self.storage.write(MEMORY_FILE, memory)

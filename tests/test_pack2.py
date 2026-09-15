@@ -218,6 +218,8 @@ class TestFastTriage:
 
 class TestSameFilesDedup:
     def _twin(self, eng, files):
+        # Suppress on-add auto-merge: these tests exercise Deduplicator itself.
+        eng._auto_merging = True
         return eng.add_memory({
             "type": "feature",
             "description": "TASK-99: identical dashboard server with graphs and tabs",

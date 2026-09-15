@@ -158,9 +158,17 @@ def entry_effective_confidence(
       * each confirmed use extends the half-life (USAGE_HALF_LIFE_BONUS)
     """
     anchor = _anchor_ts(entry)
-    hl = half_life_days * (
-        DECISION_HALF_LIFE_MULT if entry.get("type") == "decision" else 1.0
+    # Slow-decay class: explicit decisions AND entries tagged 'durable'
+    # (architectural facts, root causes, environment constraints — knowledge
+    # that holds until superseded, whatever type it was recorded under).
+    # Audit #3: the most valuable notes in a real store (ARCHITECTURE…,
+    # "is NOT a ScanScore bug", build-env constraints) were sinking to the
+    # floor within weeks because "note" conflates scratch with gold.
+    slow = (
+        entry.get("type") == "decision"
+        or "durable" in (entry.get("tags") or [])
     )
+    hl = half_life_days * (DECISION_HALF_LIFE_MULT if slow else 1.0)
     usage = int(entry.get("usage_count") or 0)
     if usage > 0:
         hl *= 1.0 + USAGE_HALF_LIFE_BONUS * usage

@@ -27,6 +27,9 @@ def _add(engine: MemoryEngine, description: str, type_: str = "bug_fix",
     triggering auto-conflict detection between unrelated test entries."""
     _COUNTER[0] += 1
     uid = _COUNTER[0]
+    # These tests exercise MANUAL conflict resolution — keep seeded duplicates
+    # intact by suppressing the engine's on-add auto-merge.
+    engine._auto_merging = True
     result = engine.add_memory({
         "type": type_,
         "description": "{} [uid={}]".format(description, uid),

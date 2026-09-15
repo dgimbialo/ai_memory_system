@@ -182,12 +182,20 @@ def detect_conflict(a: MemoryEntry, b: MemoryEntry) -> ConflictRecord | None:
     )
 
 
+_DEAD_STATUS = {"superseded", "resolved"}
+
+
 def find_conflicts_for(
     new_entry: MemoryEntry, existing: List[MemoryEntry]
 ) -> List[ConflictRecord]:
     out: List[ConflictRecord] = []
     for other in existing:
         if other.id == new_entry.id:
+            continue
+        # A conflict with a dead entry is meaningless — and worse: a merged
+        # entry is by construction a near-copy of its superseded parents, so
+        # without this filter every merge re-flagged itself as a duplicate.
+        if other.status in _DEAD_STATUS:
             continue
         c = detect_conflict(new_entry, other)
         if c is not None:
@@ -208,7 +216,11 @@ def find_all_conflicts(entries: List[MemoryEntry]) -> List[ConflictRecord]:
     out: List[ConflictRecord] = []
     seen: set = set()
     for i, a in enumerate(entries):
+        if a.status in _DEAD_STATUS:
+            continue
         for b in entries[i + 1:]:
+            if b.status in _DEAD_STATUS:
+                continue
             key = tuple(sorted((a.id, b.id)))
             if key in seen:
                 continue

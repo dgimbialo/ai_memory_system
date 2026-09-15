@@ -35,6 +35,9 @@ def _add(engine: MemoryEngine,
          confidence: float = 0.9) -> str:
     _CTR[0] += 1
     uid = _CTR[0]
+    # These tests exercise the Deduplicator itself, so duplicates must be
+    # allowed to accumulate: suppress the engine's on-add auto-merge.
+    engine._auto_merging = True
     r = engine.add_memory({
         "type": type_,
         "description": description,

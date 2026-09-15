@@ -82,7 +82,8 @@ def _format_entry(e: dict) -> str:
     files = ", ".join(e.get("files") or [])[:60]
     conf = e.get("confidence", 0.0)
     status = e.get("status", "active")
-    line = f"- [{eid}] ({etype}, conf={conf:.2f}, {status}) {desc}"
+    marker = " ⚠in-conflict" if status == "conflict" else ""
+    line = f"- [{eid}] ({etype}, conf={conf:.2f}, {status}{marker}) {desc}"
     if files:
         line += f"  → {files}"
     if ts:
@@ -145,7 +146,14 @@ def _build_summary(entries: list, conflicts: list, project: str | None) -> str:
     lines.append(f"## Project Memory — {project_label}  ({now_utc})")
     lines.append("")
 
-    active = [e for e in entries if e.get("status") == "active"]
+    # Entries in an unresolved conflict are still knowledge — show them with a
+    # warning marker instead of hiding them (an entry could sit quarantined for
+    # weeks). Archived entries (floor + long-unused) are the one exclusion.
+    active = [
+        e for e in entries
+        if e.get("status") in ("active", "conflict")
+        and "archived" not in (e.get("tags") or [])
+    ]
 
     def _emit(section_entries: list, header: str, limit: int) -> None:
         picked = [e for e in section_entries if e.get("id") not in shown][:limit]
