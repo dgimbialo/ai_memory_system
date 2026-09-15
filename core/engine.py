@@ -297,9 +297,16 @@ class MemoryEngine:
         # Conflict detection — bounded: one add can legitimately conflict with
         # at most a few prior entries; recording every match floods the queue
         # (the same burst problem as full scans, just death by a thousand cuts).
-        conflicts = find_conflicts_for(entry, existing_entries)
-        conflicts.sort(key=lambda c: float(getattr(c, "similarity", 0.0)), reverse=True)
-        conflicts = conflicts[: self._MAX_NEW_CONFLICTS_PER_ADD]
+        # NEVER run it for an entry synthesized by an auto-merge: a merged
+        # entry is a near-copy of its relatives by construction, so checking it
+        # re-mints duplicate conflicts and feeds the merge loop its own output
+        # (a real store exploded 42 -> 978 entries before this guard existed).
+        if getattr(self, "_auto_merging", False):
+            conflicts = []
+        else:
+            conflicts = find_conflicts_for(entry, existing_entries)
+            conflicts.sort(key=lambda c: float(getattr(c, "similarity", 0.0)), reverse=True)
+            conflicts = conflicts[: self._MAX_NEW_CONFLICTS_PER_ADD]
         conflict_dicts = self._read_conflicts()
         for c in conflicts:
             self.updater.mark_conflict(memory, c.entry_a, c.entry_b)
@@ -414,6 +421,9 @@ class MemoryEngine:
             if "duplicate" in (c.get("reason") or "").lower()
             and float(c.get("similarity") or 0) >= self._AUTO_MERGE_SIM
         ]
+        # Hard cap per call: pairwise merging of a large duplicate family is
+        # the Deduplicator's job (single cluster merge), not a merge cascade.
+        candidates = candidates[:10]
         if not candidates:
             return []
         self._auto_merging = True

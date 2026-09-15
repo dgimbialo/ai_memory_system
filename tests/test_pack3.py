@@ -86,6 +86,27 @@ class TestDuplicateAutoMerge:
         assert len(active_dupes) == 1
         assert not any(e.get("status") == "conflict" for e in mem)
 
+    def test_merge_cascade_is_bounded(self, tmp_path):
+        """Regression for the runaway cascade (42 -> 978 entries in a real
+        store): a merged entry must NOT re-enter conflict detection, so N
+        identical adds converge to one active entry with bounded growth."""
+        eng = MemoryEngine(str(tmp_path))
+        payload = {"type": "note",
+                   "description": "Task 1146 combo labels resolved through part table lookup",
+                   "fix": "identical text repeated to simulate duplicate saves",
+                   "files": ["CDlgStaffConnect.cpp"], "confidence": 0.5}
+        for _ in range(4):
+            eng.add_memory(dict(payload))
+        mem = eng._read_memory()
+        # 4 adds + at most 3 merge canonicals; anything more means a cascade
+        assert len(mem) <= 7
+        active = [e for e in mem if e.get("status") == "active"]
+        assert len(active) == 1
+        # Sub-threshold (<0.95) duplicate records may remain for triage, but
+        # the queue must stay bounded — no self-feeding growth.
+        open_c = [c for c in eng._read_conflicts() if not c.get("resolved")]
+        assert len(open_c) <= 3
+
     def test_injection_shows_conflict_status_entries(self, tmp_path):
         entries = [
             {"id": "aa11", "type": "note", "status": "conflict",

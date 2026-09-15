@@ -169,12 +169,17 @@ def _build_summary(entries: list, conflicts: list, project: str | None) -> str:
     def _rank_key(e: dict):
         return (_eff_conf(e, now), e.get("last_used") or e.get("timestamp") or "")
 
-    # 1. Key decisions — the "why" that should never be relearned. Highest value.
+    # 1. Key decisions AND durable knowledge (architecture facts, root causes,
+    # environment constraints) — the "why" that should never be relearned.
+    # Durable entries earn a guaranteed slot here: they decay slowly by design,
+    # but a durable note born at 0.45 would otherwise lose the High-Confidence
+    # ranking to fresher entries and never reach the agent at all.
     decisions = sorted(
-        (e for e in active if e.get("type") == "decision"),
+        (e for e in active
+         if e.get("type") == "decision" or "durable" in (e.get("tags") or [])),
         key=_rank_key, reverse=True,
     )
-    _emit(decisions, "### Key Decisions", 5)
+    _emit(decisions, "### Key Decisions & Durable Knowledge", 7)
 
     # 2. Most-trusted knowledge by decayed confidence (any remaining type).
     high_value = sorted(active, key=_rank_key, reverse=True)

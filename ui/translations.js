@@ -15,7 +15,12 @@ export const translations = {
     'tab.conflicts': 'Conflicts',
     'tab.graph': 'Graph',
     'tab.files': 'Files',
+    'tab.log': 'Live Log',
     'tab.settings': 'Settings',
+    'nav.overview': 'Overview',
+    'nav.memory': 'Memory',
+    'nav.activity': 'Activity',
+    'nav.system': 'System',
     
     // Dashboard - KPI Cards
     'kpi.totalEntries': 'Total Entries',
@@ -266,7 +271,12 @@ export const translations = {
     'tab.conflicts': 'Конфлікти',
     'tab.graph': 'Граф',
     'tab.files': 'Файли',
+    'tab.log': 'Живий журнал',
     'tab.settings': 'Параметри',
+    'nav.overview': 'Огляд',
+    'nav.memory': 'Пам\'ять',
+    'nav.activity': 'Активність',
+    'nav.system': 'Система',
     
     // Dashboard - KPI Cards
     'kpi.totalEntries': 'Всього записів',

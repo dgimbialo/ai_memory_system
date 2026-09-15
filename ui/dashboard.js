@@ -46,7 +46,7 @@ function destroyChart(id) {
 }
 
 function baseFont() {
-  return { color: CHART_DEFAULTS.color, family: "'Segoe UI', sans-serif", size: 13 };
+  return { color: CHART_DEFAULTS.color, family: "'Segoe UI', sans-serif", size: 14 };
 }
 
 function labelFont() {

@@ -23,18 +23,37 @@
     </div>
   </header>
 
-  <!-- ── Tab Navigation ── -->
+  <!-- ── Sidebar Navigation ── -->
   <nav class="tab-nav" id="tabNav">
-    <button class="tab-btn active" data-tab="dashboard" data-i18n="tab.dashboard">📊 Dashboard</button>
-    <button class="tab-btn" data-tab="entries" data-i18n="tab.entries">📝 Entries</button>
-    <button class="tab-btn" data-tab="conflicts" data-i18n="tab.conflicts">
-      ⚠️ Conflicts
+    <div class="nav-group-label" data-i18n="nav.overview">Overview</div>
+    <button class="tab-btn active" data-tab="dashboard">
+      <span class="nav-icon">📊</span><span class="nav-label" data-i18n="tab.dashboard">Dashboard</span>
+    </button>
+
+    <div class="nav-group-label" data-i18n="nav.memory">Memory</div>
+    <button class="tab-btn" data-tab="entries">
+      <span class="nav-icon">📝</span><span class="nav-label" data-i18n="tab.entries">Entries</span>
+    </button>
+    <button class="tab-btn" data-tab="conflicts">
+      <span class="nav-icon">⚠️</span><span class="nav-label" data-i18n="tab.conflicts">Conflicts</span>
       <span class="badge" id="conflictBadge" style="display:none"></span>
     </button>
-    <button class="tab-btn" data-tab="graph" data-i18n="tab.graph">🔗 Graph</button>
-    <button class="tab-btn" data-tab="files" data-i18n="tab.files">📂 Files</button>
-    <button class="tab-btn" data-tab="log">📡 Live Log</button>
-    <button class="tab-btn" data-tab="settings" data-i18n="tab.settings">⚙️ Settings</button>
+    <button class="tab-btn" data-tab="graph">
+      <span class="nav-icon">🔗</span><span class="nav-label" data-i18n="tab.graph">Graph</span>
+    </button>
+    <button class="tab-btn" data-tab="files">
+      <span class="nav-icon">📂</span><span class="nav-label" data-i18n="tab.files">Files</span>
+    </button>
+
+    <div class="nav-group-label" data-i18n="nav.activity">Activity</div>
+    <button class="tab-btn" data-tab="log">
+      <span class="nav-icon">📡</span><span class="nav-label" data-i18n="tab.log">Live Log</span>
+    </button>
+
+    <div class="nav-group-label" data-i18n="nav.system">System</div>
+    <button class="tab-btn" data-tab="settings">
+      <span class="nav-icon">⚙️</span><span class="nav-label" data-i18n="tab.settings">Settings</span>
+    </button>
   </nav>
 
   <!-- ── Main Content ── -->
