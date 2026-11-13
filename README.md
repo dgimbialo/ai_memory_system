@@ -30,7 +30,7 @@ AI agents start every new chat session with a **blank slate** — no memory of d
 │  VS Code (Copilot Agent mode)    │  │  Claude Code / Cursor / VS 2022+     │
 │                                  │  │                                      │
 │  SessionStart hook               │  │  mcp_server.py (stdio JSON-RPC 2.0)  │
-│    └─► context_injector.py       │  │    7 tools: memory_query, memory_add,│
+│    └─► context_injector.py       │  │   11 tools: memory_query, memory_add,│
 │        injects memory summary    │  │    memory_confirm, memory_reject,    │
 │                                  │  │    memory_recent, memory_conflicts,  │
 │  PostToolUse hook                │  │    memory_stats                      │
@@ -46,20 +46,43 @@ AI agents start every new chat session with a **blank slate** — no memory of d
         detection · auto-tagging · function extraction · daily decay ·
         conflict triage · dedup + summary rollup · file summaries · wiki
                 ▼
-        data/projects/<name>/memory.json    (per-project, isolated)
+        data/projects/<name>/memory.db      (SQLite, per-project, isolated)
         data/projects/<name>/wiki/          (Markdown wiki)
 ```
 
 One installation (e.g. `D:\ai_memory_system`) serves **all** your projects — each with isolated data under `data/projects/<name>/`. The registry `data/connected_projects.json` remembers every connected project so `connect.py --all` can refresh hooks and configs everywhere at once.
+
+## Architecture v2: storage, daemon, hybrid recall, knowledge layer
+
+**Storage: one SQLite file per project.** `data/projects/<slug>/memory.db` (WAL mode) holds entries, conflicts, the append-only event log and the wiki/summary documents. The engine still talks to the same `Storage.read/write/append_log` API, so nothing above it changed. Legacy `*.json` stores are imported automatically on first open and moved to `legacy_json/`. A consistent snapshot is taken once a day (`.snapshots/`, 14 kept) and before any write that would delete a large share of a store. `run.py export_json` writes the old JSON documents back out.
+
+**Memory daemon.** `server.py` is both the dashboard and a background daemon (`--daemon`, started on demand by the hooks). It keeps the embedding models warm, serves hybrid recall to the per-prompt hook (`/api/recall`), encodes cache misses for CLI and MCP processes (`/api/embed`), warms the embedding cache and runs store maintenance on a timer. Clients fall back to local work when it is not running.
+
+**Two embedding roles, cached on disk.** `multilingual-e5-small` ranks search and recall (cross-lingual: a Ukrainian prompt finds English entries); `all-MiniLM-L6-v2` stays in charge of dedup/conflict thresholds, which were calibrated on its score distribution. All vectors are persisted in `data/embeddings.db`, so a fresh process never re-encodes a store.
+
+**Hybrid search.** BM25 over symbols (x3), description (x2) and body, fused with the semantic leg (`core/search.py`). The same ranking serves `query_memory`, the recall hook and the daemon.
+
+**Per-prompt recall rules.** A lexical match (two or more rare query terms) is shown in full, up to 3 entries. A semantic-only match needs a prompt with real content and is limited to 3 one-liners. Nothing is repeated within a session, and a per-project rate limit stops automated loops from re-reading the same memories.
+
+**Knowledge layer.**
+- `rule` type and pinning: standing instructions are shown first at every session start and never decay or get archived. Descriptions starting with `RULE`, `USER RULE`, `ПРАВИЛО` and similar are pinned automatically.
+- `supersedes`: a correction marks the entries it replaces as superseded (`superseded_by`, `valid_to`), and they stop being recalled.
+- Branch and commit are stamped on every entry; recall flags knowledge that comes from another, unmerged branch.
+- `task`: ticket references (`#1145`, `SS-809`) are extracted or set explicitly; `/memtask` prints the timeline of a task.
+- Session digest: a `SessionEnd` hook writes the hand-off note that the next session sees as "Last session".
+- Knowledge cards: `/memconsolidate` lists per-file clusters and the agent distils each into one card (`summarizes`); source entries stay searchable but leave the session start.
+
+**Project resolution.** `core/project_resolve.py` maps a working directory to a store for both the MCP server and the CLI: a registered project that contains it, else its git root, auto-provisioned on first use. Nothing falls into a shared "default" store silently any more.
 
 ## Features
 
 ### Capture & recall
 - **SessionStart injection** — a relevance-first memory summary (key decisions → high-confidence entries → unstable surfaces → recent activity → open conflicts) is injected into every new agent session, both in VS Code Copilot and in Claude Code; every injection is logged as a *read* so the read/write balance is measurable
 - **PostToolUse hook** (VS Code) — deterministically records a memory entry after every file write
-- **MCP server** — 7 tools (`memory_query/add/confirm/reject/recent/conflicts/stats`) over stdio JSON-RPC 2.0 for Claude Code, Cursor, VS Code, VS 2022/2026
-- **Slash commands** — 15 global `/mem*` commands available in any Claude Code chat
-- **Semantic search** — query ranking blends 90% semantic similarity with 10% decayed confidence; ties break by recency
+- **MCP server** — 11 tools (`memory_query/add/confirm/reject/recent/conflicts/stats/resolve/pin/task/consolidate`) over stdio JSON-RPC 2.0 for Claude Code, Cursor, VS Code, VS 2022/2026
+- **Slash commands** — 19 global `/mem*` commands available in any Claude Code chat
+- **Per-prompt recall** — a `UserPromptSubmit` hook surfaces the few memories relevant to each prompt, in any language
+- **Hybrid search** — BM25 + multilingual embeddings; ranking blends 90% relevance with 10% decayed confidence, ties break by recency, superseded entries are excluded
 
 ### Trust economy (confidence lifecycle)
 - **Type-aware birth confidence** — decision `0.75`, bug_fix/feature `0.60`, note `0.45` (explicit values always respected)
@@ -81,7 +104,7 @@ One installation (e.g. `D:\ai_memory_system`) serves **all** your projects — e
 
 ### Storage & integrity
 - **Append-first storage** — historical entries are never silently overwritten
-- **Atomic JSON writes** with automatic backup before overwrite
+- **Transactional SQLite store** (WAL) with daily snapshots and a safety snapshot before bulk deletes
 - **Activity log** — every change timestamped with action, affected IDs and reason
 - **Test-ID links** — warns when superseding entries that have linked tests
 - **Git stale check** — flags entries whose referenced files/functions no longer exist in the repo
@@ -94,7 +117,7 @@ One installation (e.g. `D:\ai_memory_system`) serves **all** your projects — e
 - **Learner** — analyses Copilot chat logs, extracts patterns, updates managed project instructions
 - **Daemon** — background file watcher for non-agent edits (fallback)
 - **Multi-project** — data isolated per project under `data/projects/<slug>/`
-- **Offline-first embeddings** — `sentence-transformers` when installed, deterministic local hasher otherwise; LRU-cached
+- **Offline-first embeddings** — two `sentence-transformers` models (retrieval + similarity) when installed, deterministic local hasher otherwise; cached in memory and on disk
 
 ---
 
@@ -195,6 +218,14 @@ python run.py --project my_app lint
 | `update_instructions` | Generate Learned Patterns from high-confidence decisions into copilot-instructions.md |
 | `render_wiki` | Render Markdown wiki under `data/…/wiki/` |
 | `lint` | 7 health checks: stale, low-confidence, orphans, duplicates… |
+| `supersede` | Mark OLD as replaced by NEW (correction chain) |
+| `pin` | Pin/unpin an entry (`--unpin`) |
+| `task` | Timeline of all entries about one task/ticket |
+| `move_entries` | Move entries into another project store (`--to <slug>`) |
+| `consolidation_candidates` | Per-file clusters ready for a knowledge card |
+| `auto_session_summary` | Write the end-of-session digest (what the SessionEnd hook does) |
+| `snapshot` | Write a consistent copy of the store to `.snapshots/` |
+| `export_json` | Export the store as the five legacy JSON documents |
 | `state` | Entry count, conflicts, wiki, embedding backend |
 
 ---
@@ -298,7 +329,9 @@ This creates/updates:
 
 Every connect registers the project in `data/connected_projects.json`, so a later `connect.py --all` upgrades all of them in one go. All config writes are merges — idempotent and safe to re-run.
 
-Then **reload your IDE** — the agent now has 7 memory tools available.
+**Local configs stay out of git.** The MCP and hook configs contain absolute paths of your machine. In a git repo, `connect.py` adds every such file that git does not already ignore to `.git/info/exclude` (local to your clone, never committed). A file that is already tracked cannot be hidden this way: connect prints a warning with the `git rm --cached` command instead of touching it. Use `--no-git-exclude` to skip this step.
+
+Then **reload your IDE** — the agent now has 11 memory tools available.
 
 ### The feedback loop, closed automatically
 
@@ -327,6 +360,10 @@ Inside any agent chat, use these slash commands:
 | `/memlint` | Run health checks |
 | `/memwiki` | Render Markdown wiki |
 | `/memui [--port N]` | Launch web dashboard |
+| `/memtask <id>` | Timeline of one task/ticket |
+| `/mempin <id> [--unpin]` | Pin a memory: always injected, never decays |
+| `/memsupersede <old> <new>` | Mark an entry as replaced by a newer one |
+| `/memconsolidate` | Distil big per-file clusters into knowledge cards |
 | `/memsession` | Create a session summary |
 
 All commands work **offline** — no external APIs, pure local Python + embeddings.
@@ -421,7 +458,7 @@ python run_infra.py daemon --projects C:\Projects\MyApp C:\Projects\OtherApp
 ai_memory_system/
 ├── core/
 │   ├── engine.py             # single gateway — all memory operations
-│   ├── storage.py            # atomic JSON I/O + backups
+│   ├── storage.py            # SQLite store behind the Storage API, snapshots, legacy import
 │   ├── models.py             # MemoryEntry, ConflictRecord (depends_on, test_ids fields)
 │   ├── conflict.py           # conflict detection rules + hot-file discount
 │   ├── conflict_resolver.py  # supersede / merge / dismiss actions
@@ -431,7 +468,14 @@ ai_memory_system/
 │   ├── dependency_graph.py   # depends_on graph — add/remove/query/suggest
 │   ├── summarizer.py         # per-file auto summary generation
 │   ├── git_inspector.py      # git stale check via subprocess
-│   ├── embeddings.py         # sentence-transformers + deterministic fallback
+│   ├── embeddings.py         # two model roles, disk cache, daemon-assisted encoding
+│   ├── search.py             # BM25 + semantic hybrid ranking
+│   ├── recall.py             # per-prompt recall selection (shared by hook and daemon)
+│   ├── prompt_recall.py      # UserPromptSubmit hook
+│   ├── session_end.py        # SessionEnd hook: hand-off digest
+│   ├── daemon_client.py      # thin client for the local memory daemon
+│   ├── project_resolve.py    # working directory -> project store
+│   ├── gitinfo.py            # branch/commit stamping
 │   ├── updater.py            # controlled merge & wiki rebuild
 │   ├── wiki_md.py            # Markdown wiki renderer (Obsidian wikilinks)
 │   ├── lint.py               # 7 health checks
@@ -603,6 +647,14 @@ AI-агенти починають кожну нову сесію з **чист�
 | Суперечності між змінами залишаються непоміченими | Минулі та поточні зміни порівнюються; конфлікти виявляються і виводяться для вирішення |
 ---
 
+### Архітектура v2 (коротко)
+
+- **Сховище**: один файл SQLite на проект (`memory.db`), транзакції, щоденні знімки на 14 днів; старі JSON-файли імпортуються автоматично.
+- **Демон**: `server.py` тримає моделі прогрітими, обслуговує пригадування на кожен промпт і фонове обслуговування; запускається хуками за потреби.
+- **Гібридний пошук**: BM25 плюс багатомовна модель `multilingual-e5-small`. Український промпт знаходить англомовні записи.
+- **Шар знань**: тип `rule` і закріплення (правила завжди в сесії, не старіють), `supersedes` (ланцюжки виправлень), гілка і коміт на кожному записі, задачі (`/memtask`), авто-підсумок сесії, картки знань (`/memconsolidate`).
+- **Визначення проекту**: за робочою папкою (зареєстрований проект або корінь git), нічого не потрапляє в спільне сховище мовчки.
+
 ### Ключові можливості (Key Features)
 
 - **SessionStart інжекція** — стислий підсумок пам'яті (рішення → найдостовірніші записи → нестабільні місця → нещодавнє → конфлікти) автоматично вставляється в кожну нову сесію: і в VS Code Copilot, і в Claude Code; кожна інжекція логується як *читання*
@@ -676,7 +728,7 @@ python server.py  # запуск на localhost:5001
 
 ```
 data/projects/my_app/
-├── memory.json           # всі записи
+├── memory.db             # SQLite: записи, конфлікти, журнал подій, документи
 ├── conflicts.json        # виявлені конфлікти
 ├── activity_log.json     # аудит кожної зміни
 ├── file_summaries.json   # резюме кожного файлу
@@ -775,7 +827,9 @@ python D:\ai_memory_system\connect.py --all
 
 Кожне підключення реєструє проект у `data/connected_projects.json`; крім MCP-конфігів, для Claude Code створюється SessionStart-хук (`.claude/settings.json`), який інжектує пам'ять у кожну нову сесію.
 
-Потім перезавантажте IDE — агент матиме доступ до 7 інструментів пам'яті.
+Конфіги містять абсолютні шляхи вашої машини, тому в git-репозиторії `connect.py` сам додає їх у `.git/info/exclude` (локальний файл, у коміти не потрапляє), якщо git їх ще не ігнорує. Файл, який уже відстежується, так не сховати: про нього виводиться попередження з командою `git rm --cached`. Вимкнути крок: `--no-git-exclude`.
+
+Потім перезавантажте IDE — агент матиме доступ до 11 інструментів пам'яті.
 
 **Слеш-команди в чаті агента:**
 - `/mem <query>` — семантичний пошук

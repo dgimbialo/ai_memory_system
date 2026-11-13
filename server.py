@@ -30,6 +30,7 @@ REST API:
 from __future__ import annotations
 
 import argparse
+import os
 import collections
 import json
 import queue as _queue
@@ -57,6 +58,7 @@ DATA_DIR = ROOT / "data"
 SETTINGS_FILE = "settings.json"
 
 from core.engine import MemoryEngine  # noqa: E402
+from core.storage import store_entry_count  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Default settings model
@@ -177,29 +179,16 @@ def _list_projects() -> list:
         for d in sorted(projects_dir.iterdir()):
             if not d.is_dir():
                 continue
-            mem_file = d / "memory.json"
-            count = 0
-            if mem_file.exists():
-                try:
-                    data = json.loads(mem_file.read_text(encoding="utf-8"))
-                    count = len(data) if isinstance(data, list) else 0
-                except Exception:
-                    pass
+            count = store_entry_count(d)
             # Hide empty stores (test artifacts, slug typos) from the dropdown —
             # they reappear automatically once they get their first entry.
             if count == 0:
                 continue
             projects.append({"name": d.name, "entry_count": count})
     # Include default project if it has data
-    default_mem = DATA_DIR / "memory.json"
-    if default_mem.exists():
-        try:
-            data = json.loads(default_mem.read_text(encoding="utf-8"))
-            count = len(data) if isinstance(data, list) else 0
-            if count > 0:
-                projects.insert(0, {"name": "default", "entry_count": count})
-        except Exception:
-            pass
+    count = store_entry_count(DATA_DIR)
+    if count > 0:
+        projects.insert(0, {"name": "default", "entry_count": count})
     return projects
 
 
@@ -246,7 +235,9 @@ class MemoryHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
-        if path.startswith("/api/"):
+        if path == "/api/health":
+            self._daemon_health()
+        elif path.startswith("/api/"):
             self._dispatch_api("GET", path, qs, {})
         else:
             self._serve_static(path)
@@ -256,7 +247,14 @@ class MemoryHandler(BaseHTTPRequestHandler):
         path = parsed.path
         qs = parse_qs(parsed.query)
         body = self._read_body()
-        self._dispatch_api("POST", path, qs, body)
+        if path == "/api/embed":
+            self._daemon_embed(body)
+        elif path == "/api/recall":
+            self._daemon_recall(body)
+        elif path == "/api/shutdown":
+            self._daemon_shutdown()
+        else:
+            self._dispatch_api("POST", path, qs, body)
 
     def do_PATCH(self):
         parsed = urlparse(self.path)
@@ -264,6 +262,49 @@ class MemoryHandler(BaseHTTPRequestHandler):
         qs = parse_qs(parsed.query)
         body = self._read_body()
         self._dispatch_api("PATCH", path, qs, body)
+
+    # ── memory daemon endpoints (warm models, hybrid recall) ───────────────
+
+    def _daemon_health(self):
+        from core import embeddings, daemon_client
+        self._json({"daemon": True, "api_version": daemon_client.API_VERSION,
+                    "pid": os.getpid(), "models_loaded": embeddings.models_loaded()})
+
+    def _daemon_embed(self, body: dict):
+        from core import embeddings
+        model = str(body.get("model") or "")
+        texts = body.get("texts") or []
+        if model not in (embeddings.SIM_MODEL, embeddings.RET_MODEL) or not isinstance(texts, list):
+            self._error("unknown model or bad payload", 400)
+            return
+        with _EMBED_LOCK:
+            vecs = embeddings.encode_raw(model, [str(t) for t in texts[:512]])
+        self._json({"vectors": [list(v) for v in vecs]})
+
+    def _daemon_recall(self, body: dict):
+        """Hybrid per-prompt recall for the UserPromptSubmit hook."""
+        t0 = _time.perf_counter()
+        project = str(body.get("project") or "") or None
+        text = ""
+        try:
+            from core.recall import recall_for_prompt
+            from core.gitinfo import current as _git_current
+            data_dir = _data_dir(project)
+            branch = _git_current(_project_slug(project))[0] if project else ""
+            with _EMBED_LOCK:
+                text = recall_for_prompt(data_dir, project, str(body.get("prompt") or ""),
+                                         str(body.get("session_id") or ""),
+                                         semantic=True, current_branch=branch)
+        except Exception:
+            text = ""
+        self._json({"text": text})
+        _audit("hook", "POST", "/api/recall",
+               {"prompt": str(body.get("prompt") or "")[:160], "returned_chars": len(text)},
+               200, (_time.perf_counter() - t0) * 1000, project)
+
+    def _daemon_shutdown(self):
+        self._json({"ok": True})
+        threading.Timer(0.3, lambda: os._exit(0)).start()
 
     # ── router ─────────────────────────────────────────────────────────────
 
@@ -507,7 +548,7 @@ class MemoryHandler(BaseHTTPRequestHandler):
                 # inject_context = the SessionStart hook read (primary channel)
                 if "query" in action or "recent" in action or "inject" in action:
                     reads += 1
-                elif action in ("add_memory", "mcp:memory_add"):
+                elif action == "add_memory":
                     writes += 1
         except Exception:
             pass
@@ -780,6 +821,66 @@ class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
 
 
+_EMBED_LOCK = threading.Lock()
+_DAEMON_STATE = DATA_DIR / "daemon.json"
+_MODEL_IDLE_UNLOAD_S = 30 * 60
+_MAINTENANCE_EVERY_S = 6 * 3600
+
+
+def _start_daemon_services(port: int) -> None:
+    """Background duties of the memory daemon. Every dashboard instance is
+    also the daemon: it advertises itself, keeps the embedding models warm
+    while they are in use, and runs store maintenance on a timer so upkeep no
+    longer depends on somebody writing or querying."""
+    import atexit
+    from core import daemon_client, embeddings
+
+    try:
+        _DAEMON_STATE.write_text(json.dumps({
+            "pid": os.getpid(), "port": port, "api_version": daemon_client.API_VERSION,
+            "started": datetime.now(timezone.utc).isoformat(),
+        }), encoding="utf-8")
+        atexit.register(lambda: _DAEMON_STATE.unlink(missing_ok=True))
+    except OSError:
+        pass
+
+    def _warm():
+        try:
+            with _EMBED_LOCK:
+                embeddings.encode_raw(embeddings.RET_MODEL, ["warm up"])
+                embeddings.encode_raw(embeddings.SIM_MODEL, ["warm up"])
+        except Exception:
+            pass
+
+    def _housekeeping():
+        last_maintenance = _time.time() - _MAINTENANCE_EVERY_S + 300  # first run after 5 min
+        while True:
+            _time.sleep(60)
+            try:
+                if embeddings.models_loaded() and embeddings.idle_seconds() > _MODEL_IDLE_UNLOAD_S:
+                    with _EMBED_LOCK:
+                        embeddings.unload_models()
+                if _time.time() - last_maintenance >= _MAINTENANCE_EVERY_S:
+                    last_maintenance = _time.time()
+                    from core.storage import has_store
+                    dirs = [DATA_DIR] + ([d for d in (DATA_DIR / "projects").iterdir() if d.is_dir()]
+                                         if (DATA_DIR / "projects").exists() else [])
+                    for d in dirs:
+                        if has_store(d):
+                            try:
+                                eng = MemoryEngine(d)
+                                eng.run_daily_maintenance()
+                                with _EMBED_LOCK:
+                                    eng.warm_embeddings()
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+    threading.Thread(target=_warm, daemon=True).start()
+    threading.Thread(target=_housekeeping, daemon=True).start()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="AI Memory System — local HTML dashboard server",
@@ -790,6 +891,8 @@ def main():
                         help="Listen port (default: 5001)")
     parser.add_argument("--no-browser", action="store_true",
                         help="Do not open browser automatically")
+    parser.add_argument("--daemon", action="store_true",
+                        help="Run as the background memory daemon (started by hooks)")
     args = parser.parse_args()
 
     url = f"http://localhost:{args.port}"
@@ -813,6 +916,8 @@ def main():
 
     if not args.no_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+
+    _start_daemon_services(args.port)
 
     try:
         server.serve_forever()

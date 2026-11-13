@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 # tagged by an older detector are automatically re-evaluated (see
 # MemoryEngine._maybe_auto_recompute_unstable). v2 = function-level surface
 # matching + hotspot guard + small-project guard.
-DETECTOR_VERSION: int = 2
+DETECTOR_VERSION: int = 3  # v3: surfaces cleaned of prose words mistaken for functions
 
 # Number of distinct add+revert pairs on the same surface before warning
 UNSTABLE_THRESHOLD = 2

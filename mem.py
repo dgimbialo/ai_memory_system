@@ -62,23 +62,24 @@ def _slug(name: str) -> str:
 
 
 def _resolve_project() -> Optional[str]:
-    """Return a project slug or path that run.py understands, or None."""
-    # 1. Explicit env override
+    """Return a project slug that run.py understands, or None (shared store).
+
+    Delegates to core.project_resolve so slash commands and the MCP server
+    always agree. The old version walked up to the drive root, whose empty
+    name slugified to "default" - every unconnected folder on that drive then
+    shared one store (17 entries of three projects ended up mixed there).
+    """
     explicit = os.environ.get("AI_MEMORY_PROJECT")
-    if explicit:
+    if explicit and _slug(explicit) != "default":
         return explicit
     if os.environ.get("AI_MEMORY_DATA_DIR"):
         return None  # engine uses env directly; don't pass --project
-
-    # 2. cwd and its parents
-    projects_dir = ROOT / "data" / "projects"
-    check = [Path.cwd()] + list(Path.cwd().parents)[:3]
-    for p in check:
-        slug = _slug(p.name)
-        if (projects_dir / slug).exists():
-            return slug
-
-    return None  # fall through to default store
+    try:
+        sys.path.insert(0, str(ROOT))
+        from core.project_resolve import resolve
+        return resolve(Path.cwd(), allow_plain_dir=True)
+    except Exception:
+        return None
 
 
 def _base_cmd(project: Optional[str] = None) -> List[str]:
@@ -159,6 +160,8 @@ def cmd_add(args):
     if args.files:    extra += ["--files"] + args.files.split(",")
     if args.functions: extra += ["--functions"] + args.functions.split(",")
     if args.tags:     extra += ["--tags"] + args.tags.split(",")
+    if args.supersedes: extra += ["--supersedes"] + args.supersedes.split(",")
+    if args.task:     extra += ["--task", args.task]
     r = _run_json(["add_memory", "--type", args.type,
                    "--description", " ".join(args.description)] + extra)
     if r:
@@ -246,6 +249,54 @@ def _port_in_use(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+def cmd_task(args):
+    items = _run_json(["task", args.task])
+    if not items:
+        print(f"No memories mention task {args.task}."); return 0
+    print(f"Task {args.task}: {len(items)} entries, oldest first")
+    for e in items:
+        br = f" @{e['branch']}" if e.get("branch") else ""
+        print(f"  {(e.get('timestamp') or '')[:10]} [{(e.get('id') or '?')[:8]}] "
+              f"({e.get('type')}, {e.get('status')}){br} {(e.get('description') or '')[:150]}")
+    return 0
+
+
+def cmd_pin(args):
+    r = _run_json(["pin", args.id] + (["--unpin"] if args.unpin else []))
+    if r:
+        print(f"📌 [{r['id'][:8]}] {'pinned' if r['pinned'] else 'unpinned'}")
+    return 0
+
+
+def cmd_supersede(args):
+    r = _run_json(["supersede", args.old, args.new])
+    if r:
+        print(f"↪ [{r['old'][:8]}] is now superseded by [{r['new'][:8]}]")
+    return 0
+
+
+def cmd_consolidate(args):
+    clusters = _run_json(["consolidation_candidates", "--min-entries", str(args.min)])
+    if not clusters:
+        print("Nothing to consolidate: no file has enough un-carded entries."); return 0
+    for c in clusters:
+        print(f"\n## {c['surface']}  ({c['count']} entries)")
+        for e in c["entries"]:
+            print(f"- [{e['id'][:8]}] {e['timestamp']} ({e['type']}) {e['description'][:150]}")
+            if e.get("fix"):
+                print(f"    fix: {e['fix'][:220]}")
+        print("  ids: " + ",".join(e["id"][:8] for e in c["entries"]))
+    return 0
+
+
+def cmd_move(args):
+    return _run(["move_entries"] + args.ids + ["--to", args.to])
+
+
+def cmd_snapshot(args):
+    return _run(["snapshot"])
+
+
 def cmd_ui(args):
     """Start the local web dashboard and open it in a browser."""
     import time
@@ -295,7 +346,9 @@ def build_parser() -> argparse.ArgumentParser:
     q.set_defaults(func=cmd_query)
 
     a = sub.add_parser("add", help="Add a memory entry")
-    a.add_argument("type", choices=["bug_fix","feature","decision","note"])
+    a.add_argument("type", choices=["bug_fix","feature","decision","note","rule"])
+    a.add_argument("--supersedes", default=None, help="comma-separated ids this entry replaces")
+    a.add_argument("--task", default=None, help="ticket reference, e.g. #1145")
     a.add_argument("description", nargs="+")
     a.add_argument("--fix", default=None)
     a.add_argument("--cause", default=None)
@@ -343,6 +396,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("lint", help="Health-check the store").set_defaults(func=cmd_lint)
     sub.add_parser("wiki", help="Render markdown wiki").set_defaults(func=cmd_wiki)
+
+    tk = sub.add_parser("task", help="Timeline of a task/ticket")
+    tk.add_argument("task")
+    tk.set_defaults(func=cmd_task)
+
+    pn = sub.add_parser("pin", help="Pin an entry (always injected, never decays)")
+    pn.add_argument("id"); pn.add_argument("--unpin", action="store_true")
+    pn.set_defaults(func=cmd_pin)
+
+    sp = sub.add_parser("supersede", help="Mark OLD as replaced by NEW")
+    sp.add_argument("old"); sp.add_argument("new")
+    sp.set_defaults(func=cmd_supersede)
+
+    cs = sub.add_parser("consolidate", help="Clusters ready for a knowledge card")
+    cs.add_argument("--min", type=int, default=8)
+    cs.set_defaults(func=cmd_consolidate)
+
+    mv = sub.add_parser("move", help="Move entries to another project store")
+    mv.add_argument("ids", nargs="+"); mv.add_argument("--to", required=True)
+    mv.set_defaults(func=cmd_move)
+
+    sub.add_parser("snapshot", help="Snapshot the store now").set_defaults(func=cmd_snapshot)
 
     ui = sub.add_parser("ui", help="Start web dashboard")
     ui.add_argument("--port", type=int, default=5001)

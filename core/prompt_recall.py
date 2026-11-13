@@ -1,70 +1,53 @@
-"""UserPromptSubmit hook — per-prompt memory recall.
+"""UserPromptSubmit hook - per-prompt memory recall.
 
-Claude Code runs this on EVERY user prompt, so it must be fast: no engine
-import, no embedding model — a weighted keyword-overlap scorer over the raw
-memory.json. Session-start injection gives the agent one snapshot; this hook
-closes the *pull* half of the read loop by surfacing the 1-3 entries most
-relevant to what the user just asked (audit #3: 94% of all reads were the
-session-start injection, real per-task recall almost never happened).
+Claude Code runs this on EVERY user prompt, so the hook itself never loads a
+model: it asks the local memory daemon for a hybrid (BM25 + multilingual
+embeddings) recall, and when the daemon is not up it answers from the lexical
+leg alone and starts the daemon in the background for the next prompt.
 
-Input  (stdin): Claude Code hook JSON — {"prompt": "...", "cwd": ..., ...}
+Input  (stdin): Claude Code hook JSON - {"prompt": "...", "session_id": ..., "cwd": ...}
 Output (stdout): plain markdown appended to the prompt context; empty when
-                 nothing clears the relevance threshold.
-Exit code 0 always — never block the prompt.
+                 nothing is worth showing.
+Exit code 0 always - never block the prompt.
 """
 from __future__ import annotations
 
 import json
-import re
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 DATA_DIR = ROOT / "data"
 
-MAX_RESULTS = 3
-MAX_CHARS = 1400
-# Minimum weighted score and distinct matched tokens before we say anything —
-# silence is far better than noise on every prompt.
+# Kept for backward compatibility with callers/tests of the old lexical scorer.
+from core.search import tokenize as _tokenize_list  # noqa: E402
+
 MIN_SCORE = 5
 MIN_DISTINCT = 2
 
-_STOP = frozenset((
-    "the and for with that this from into are was were will would should could "
-    "can not you your our all any has have had been being does did doing when "
-    "where what which while about after before because between during under "
-    "over then than them they there here how why yes okay please thanks thank "
-    "sure hello continue але або щоб для при цьому так добре давай зроби "
-    "його вона вони має бути було щоби який яка яке більш дуже також").split())
-
-_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}|[Ѐ-ӿ]{3,}")
-
 
 def _tokens(text: str) -> set:
-    return {w.lower() for w in _WORD_RE.findall(text or "") if w.lower() not in _STOP}
+    return set(_tokenize_list(text))
 
 
 def _score(entry: dict, q: set) -> tuple:
-    """Weighted overlap: symbols (functions/file basenames) count most."""
-    funcs = {f.lower() for f in entry.get("functions") or []}
+    """Legacy weighted-overlap score (symbols x3, description x2, body x1)."""
+    funcs = set()
+    for f in entry.get("functions") or []:
+        funcs |= _tokens(str(f))
     files = set()
     for f in entry.get("files") or []:
-        base = f.replace("\\", "/").rsplit("/", 1)[-1]
-        files.add(base.lower())
-        stem = base.rsplit(".", 1)[0].lower()
-        if len(stem) >= 3:
-            files.add(stem)
+        base = str(f).replace("\\", "/").rsplit("/", 1)[-1]
+        files |= _tokens(base.rsplit(".", 1)[0])
     desc = _tokens(entry.get("description") or "")
     body = _tokens((entry.get("cause") or "") + " " + (entry.get("fix") or "")) | \
         {t.lower() for t in entry.get("tags") or []}
-
     sym_hits = q & (funcs | files)
     desc_hits = (q & desc) - sym_hits
     body_hits = (q & body) - sym_hits - desc_hits
-    score = 3 * len(sym_hits) + 2 * len(desc_hits) + 1 * len(body_hits)
-    distinct = len(sym_hits | desc_hits | body_hits)
-    return score, distinct
+    return (3 * len(sym_hits) + 2 * len(desc_hits) + len(body_hits),
+            len(sym_hits | desc_hits | body_hits))
 
 
 def main() -> None:
@@ -85,66 +68,26 @@ def main() -> None:
     except (json.JSONDecodeError, OSError):
         sys.exit(0)
     prompt = str(data.get("prompt") or "")
-    q = _tokens(prompt)
-    if len(q) < MIN_DISTINCT:
-        sys.exit(0)  # too little signal ("continue", "yes", …) — stay silent
+    session_id = str(data.get("session_id") or "")
+    if not prompt.strip() or prompt.lstrip().startswith("/"):
+        sys.exit(0)  # slash commands carry no topic of their own
 
-    data_dir = (DATA_DIR / "projects" / project.strip().lower().replace(" ", "_")
-                if project else DATA_DIR)
+    text = None
     try:
-        entries = json.loads((data_dir / "memory.json").read_text(encoding="utf-8"))
+        from core import daemon_client
+        text = daemon_client.recall(project, prompt, session_id)
     except Exception:
-        sys.exit(0)
-    if not isinstance(entries, list):
-        sys.exit(0)
-
-    scored = []
-    for e in entries:
-        if e.get("status") not in ("active", "conflict"):
-            continue
-        tags = e.get("tags") or []
-        # Archived = retired; session summaries aggregate dozens of files and
-        # match everything — both are noise for targeted recall.
-        if "archived" in tags or "session-summary" in tags:
-            continue
-        s, d = _score(e, q)
-        if s >= MIN_SCORE and d >= MIN_DISTINCT:
-            scored.append((s, e.get("timestamp") or "", e))
-    if not scored:
-        sys.exit(0)
-    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-
-    lines = ["## Relevant project memory (auto-recall for this prompt)"]
-    for s, _, e in scored[:MAX_RESULTS]:
-        unstable = " ⚠UNSTABLE" if "unstable" in (e.get("tags") or []) else ""
-        files = ", ".join(e.get("files") or [])[:60]
-        lines.append(
-            f"- [{e.get('id', '?')[:8]}] ({e.get('type')}, conf="
-            f"{float(e.get('confidence') or 0):.2f}){unstable} "
-            f"{(e.get('description') or '')[:140]}"
-            + (f"  → {files}" if files else "")
-        )
-        fix = (e.get("fix") or "").strip()
-        if fix:
-            lines.append(f"    fix: {fix[:160]}")
-    lines.append("(memory_confirm <id> if one of these proves right)")
-    out = "\n".join(lines)
-    if len(out) > MAX_CHARS:
-        out = out[:MAX_CHARS]
-    print(out)
-
-    # Count this as a read in the loop metric (best-effort, atomic append).
-    try:
-        sys.path.insert(0, str(ROOT))
-        from core.storage import Storage
-        Storage(data_dir).append_log("activity_log.json", {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "action": "inject_prompt_recall",
-            "affected": [e.get("id", "") for _, _, e in scored[:MAX_RESULTS]],
-            "reason": f"per-prompt recall matched {len(scored)} entr(ies)",
-        })
-    except Exception:
-        pass
+        text = None
+    if text is None:  # daemon unavailable: lexical leg only, no model load
+        try:
+            from core.recall import recall_for_prompt
+            slug = project.strip().lower().replace(" ", "_") if project else None
+            data_dir = DATA_DIR / "projects" / slug if slug else DATA_DIR
+            text = recall_for_prompt(data_dir, project, prompt, session_id, semantic=False)
+        except Exception:
+            text = ""
+    if text:
+        print(text)
     sys.exit(0)
 
 

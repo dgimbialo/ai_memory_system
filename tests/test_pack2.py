@@ -78,6 +78,7 @@ class TestUsageHalfLifeBonus:
 class TestRecencyTiebreak:
     def test_fresher_of_two_identical_ranks_first(self, tmp_path):
         eng = MemoryEngine(str(tmp_path))
+        eng._auto_merging = True   # keep both identical entries (no on-add merge)
         eng.add_memory({"type": "note", "description": "midi timing quantize logic",
                         "confidence": 0.5})
         r2 = eng.add_memory({"type": "note", "description": "midi timing quantize logic",

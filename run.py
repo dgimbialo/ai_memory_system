@@ -63,9 +63,55 @@ def cmd_add_memory(args: argparse.Namespace) -> int:
         "tags": tags,
         "depends_on": args.depends_on or [],
         "test_ids": args.test_ids or [],
+        "supersedes": args.supersedes or [],
+        "summarizes": args.summarizes or [],
+        "task": args.task or "",
     }
     result = _engine(args.project).add_memory(payload)
     _print(result)
+    return 0
+
+
+def cmd_supersede(args: argparse.Namespace) -> int:
+    _print(_engine(args.project).supersede(args.old, args.new, reason=args.reason or ""))
+    return 0
+
+
+def cmd_pin(args: argparse.Namespace) -> int:
+    _print(_engine(args.project).set_pinned(args.id, not args.unpin))
+    return 0
+
+
+def cmd_task(args: argparse.Namespace) -> int:
+    items = _engine(args.project).task_timeline(args.task)
+    _print([{k: e.get(k) for k in ("id", "timestamp", "type", "status", "task", "branch", "description")}
+            for e in items])
+    return 0
+
+
+def cmd_move_entries(args: argparse.Namespace) -> int:
+    _print(_engine(args.project).move_entries(args.ids, _data_dir(args.to)))
+    return 0
+
+
+def cmd_consolidation_candidates(args: argparse.Namespace) -> int:
+    _print(_engine(args.project).consolidation_candidates(min_entries=args.min_entries))
+    return 0
+
+
+def cmd_auto_session_summary(args: argparse.Namespace) -> int:
+    r = _engine(args.project).auto_session_summary()
+    _print({"created": bool(r), "entry": (r or {}).get("entry", {}).get("id")})
+    return 0
+
+
+def cmd_snapshot(args: argparse.Namespace) -> int:
+    _print({"snapshot": str(_engine(args.project).storage.snapshot(label=args.label or ""))})
+    return 0
+
+
+def cmd_export_json(args: argparse.Namespace) -> int:
+    _print({"exported_to": str(_engine(args.project).storage.export_json(args.out))})
     return 0
 
 
@@ -289,7 +335,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     a = sub.add_parser("add_memory", help="Add a new memory entry")
-    a.add_argument("--type", required=True, choices=["bug_fix", "feature", "note", "decision"])
+    a.add_argument("--type", required=True, choices=["bug_fix", "feature", "note", "decision", "rule"])
+    a.add_argument("--supersedes", nargs="*", default=[],
+                   help="Ids (or 8-char prefixes) of entries this one replaces")
+    a.add_argument("--summarizes", nargs="*", default=[],
+                   help="Knowledge card: ids of the entries it consolidates")
+    a.add_argument("--task", default="", help="Ticket reference, e.g. '#1145' or 'SS-809'")
     a.add_argument("--description", required=True)
     a.add_argument("--cause", default="")
     a.add_argument("--fix", default="")
@@ -299,7 +350,8 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--decisions", nargs="*", default=[],
                    help="Key architectural decisions with rationale (WHY, not just WHAT)")
     a.add_argument("--status", default="active", choices=["active", "resolved", "conflict", "superseded"])
-    a.add_argument("--confidence", type=float, default=0.5)
+    a.add_argument("--confidence", type=float, default=None,
+                   help="Omit to use the type-aware birth confidence")
     a.add_argument("--tags", nargs="*", default=[])
     a.add_argument("--depends-on", dest="depends_on", nargs="*", default=[],
                    help="IDs of entries this entry builds upon (creates dependency links)")
@@ -575,6 +627,39 @@ def build_parser() -> argparse.ArgumentParser:
     tc.add_argument("--apply", dest="dry_run", action="store_false")
     tc.set_defaults(func=cmd_triage_conflicts)
 
+    sp = sub.add_parser("supersede", help="Mark OLD as replaced by NEW (correction chain)")
+    sp.add_argument("old"); sp.add_argument("new"); sp.add_argument("--reason", default=None)
+    sp.set_defaults(func=cmd_supersede)
+
+    pn = sub.add_parser("pin", help="Pin an entry: injected every session, never decays")
+    pn.add_argument("id"); pn.add_argument("--unpin", action="store_true")
+    pn.set_defaults(func=cmd_pin)
+
+    tk = sub.add_parser("task", help="Timeline of all entries about one task/ticket")
+    tk.add_argument("task")
+    tk.set_defaults(func=cmd_task)
+
+    mv = sub.add_parser("move_entries", help="Move entries into another project store")
+    mv.add_argument("ids", nargs="+"); mv.add_argument("--to", required=True, help="Target project slug")
+    mv.set_defaults(func=cmd_move_entries)
+
+    cc = sub.add_parser("consolidation_candidates",
+                        help="Clusters of entries per file that are ready for a knowledge card")
+    cc.add_argument("--min-entries", dest="min_entries", type=int, default=8)
+    cc.set_defaults(func=cmd_consolidation_candidates)
+
+    sub.add_parser("auto_session_summary",
+                   help="Write the end-of-session digest (what the SessionEnd hook does)"
+                   ).set_defaults(func=cmd_auto_session_summary)
+
+    sn = sub.add_parser("snapshot", help="Write a consistent copy of the store to .snapshots/")
+    sn.add_argument("--label", default="")
+    sn.set_defaults(func=cmd_snapshot)
+
+    ex = sub.add_parser("export_json", help="Export the store as the five legacy JSON documents")
+    ex.add_argument("--out", required=True)
+    ex.set_defaults(func=cmd_export_json)
+
     rf = sub.add_parser("reinforce", help="Confirm a memory: raise confidence, count use, reset decay clock")
     rf.add_argument("id", help="Entry id to reinforce")
     rf.add_argument("--delta", type=float, default=None, help="Confidence increase (default 0.1)")
@@ -593,6 +678,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    try:  # encode cache misses through the daemon instead of loading a model here
+        from core import embeddings
+        embeddings.use_daemon(True)
+    except Exception:
+        pass
     return args.func(args)
 
 

@@ -137,16 +137,48 @@ _FUNC_STOPWORDS = frozenset({
     "get", "put", "run", "call", "test", "min", "max", "abs", "round", "open",
 })
 
-_FUNC_CALL_RE = _re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{2,})\s*\(")
+# A call in prose: identifier glued to "(" - "RULE (2026-10-28)" is not a call.
+_FUNC_CALL_RE = _re.compile(r"(?<![A-Za-z0-9_])((?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Za-z_][A-Za-z0-9_]{2,})\((\))?")
+
+# Lower-case prose words that showed up as "functions" in real stores.
+_PROSE_WORDS = frozenset((
+    "text right left bars bar note notes rule rules decision decisions staff staves "
+    "page pages line lines row rows column columns item items value values name "
+    "names file files user client button dialog window panel label color size "
+    "width height mode state step stage part parts case check fix bug issue "
+    "change changes update result error see example examples and the for with").split())
+
+
+def is_plausible_function(name: str, empty_parens: bool = False) -> bool:
+    """Does this look like a code identifier rather than a prose word?
+
+    Audit #4: the old extractor took any word followed by "(" - "RULE (...)",
+    "DECISION (2026-10-28)", "text (left)" - and the revert detector then
+    clustered unrelated entries on those fake surfaces (18 false 'unstable'
+    tags in one store, top "functions": RULE, DECISION, text, right, bars).
+    """
+    if not name or len(name) < 3:
+        return False
+    base = name.rsplit("::", 1)[-1]
+    low = base.lower()
+    if low in _FUNC_STOPWORDS or low in _PROSE_WORDS:
+        return False
+    if "::" in name or "_" in base:
+        return True
+    if base.isupper():                      # RULE, DECISION, TODO
+        return False
+    if base.islower():                      # plain word: only "name()" counts
+        return empty_parens
+    return any(c.isupper() for c in base[1:])  # camelCase / PascalCase
 
 
 def _auto_extract_functions(entry: "MemoryEntry", cap: int = 8) -> List[str]:
     """Pull function names out of fix/description text when none were supplied.
 
     The precise (function-level) revert detector only works where entries carry
-    a ``functions`` list — in the audit that was a single project out of ten.
-    Agents rarely fill the field, but their prose usually names the functions
-    (``fixed pairing in attachGraceNotes()``), so harvest those.
+    a ``functions`` list. Agents rarely fill the field, but their prose usually
+    names the functions (``fixed pairing in attachGraceNotes()``), so harvest
+    those - but only identifier-shaped ones (see is_plausible_function).
     """
     if entry.functions:
         return []
@@ -154,13 +186,39 @@ def _auto_extract_functions(entry: "MemoryEntry", cap: int = 8) -> List[str]:
     found: List[str] = []
     for m in _FUNC_CALL_RE.finditer(text):
         name = m.group(1)
-        if name.lower() in _FUNC_STOPWORDS:
+        if not is_plausible_function(name, empty_parens=bool(m.group(2))):
             continue
         if name not in found:
             found.append(name)
         if len(found) >= cap:
             break
     return found
+
+
+# Standing instructions: pinned into every session, exempt from decay.
+_RULE_RE = _re.compile(
+    r"(?:^\s*(?:RULE|RULES|ПРАВИЛО|ПРАВИЛА|WORKING RULES?|USER RULE|CLIENT RULE)\b"
+    r"|\((?:user|client) rule\))",
+    _re.IGNORECASE,
+)
+
+# Ticket references. Hex colours (#1a2b3c) and standards (UTF-8) are not tasks.
+_TASK_RE = _re.compile(
+    r"\bTask\s*#?\s*(\d{2,6})\b|(?<![A-Za-z0-9&])#(\d{3,5})(?![0-9A-Fa-f])|\b([A-Z]{2,6}-\d{1,6})\b")
+_TASK_NOT = frozenset(("UTF", "ISO", "SHA", "CP", "MD", "RFC", "HTTP", "TLS", "SSL", "WIN",
+                       "VS", "MSVC", "CVE", "IEEE", "ANSI", "ASCII", "GPT", "COVID"))
+
+
+def _extract_task(text: str) -> str:
+    for m in _TASK_RE.finditer(text or ""):
+        if m.group(1):
+            return "#" + m.group(1)
+        if m.group(2):
+            return "#" + m.group(2)
+        ref = m.group(3)
+        if ref.split("-", 1)[0] not in _TASK_NOT:
+            return ref
+    return ""
 
 
 def _auto_tag_from_description(entry: "MemoryEntry") -> List[str]:
@@ -194,13 +252,13 @@ class MemoryEngine:
 
     # ---------- bootstrap helpers ----------
     def _ensure_initialized(self) -> None:
-        if not self.storage.path(MEMORY_FILE).exists():
+        if not self.storage.exists(MEMORY_FILE):
             self.storage.write(MEMORY_FILE, [])
-        if not self.storage.path(WIKI_FILE).exists():
+        if not self.storage.exists(WIKI_FILE):
             self.storage.write(WIKI_FILE, {"sections": {}, "entry_count": 0})
-        if not self.storage.path(CONFLICTS_FILE).exists():
+        if not self.storage.exists(CONFLICTS_FILE):
             self.storage.write(CONFLICTS_FILE, [])
-        if not self.storage.path(LOG_FILE).exists():
+        if not self.storage.exists(LOG_FILE):
             self.storage.write(LOG_FILE, [])
 
     # ---------- internal IO ----------
@@ -232,6 +290,7 @@ class MemoryEngine:
         "bug_fix":  0.60,
         "feature":  0.60,
         "note":     0.45,
+        "rule":     0.90,
     }
 
     # Cap on conflicts recorded per single add_memory (strongest first).
@@ -255,6 +314,15 @@ class MemoryEngine:
         # links; add_link below will set both sides atomically.
         if raw_depends_on and isinstance(payload, dict):
             payload = {k: v for k, v in payload.items() if k != "depends_on"}
+
+        # supersedes / summarizes may arrive as 8-char id prefixes (that is what
+        # recall and listings show); they are resolved against the store below.
+        raw_supersedes: List[str] = []
+        raw_summarizes: List[str] = []
+        if isinstance(payload, dict):
+            raw_supersedes = [str(x) for x in (payload.get("supersedes") or []) if x]
+            raw_summarizes = [str(x) for x in (payload.get("summarizes") or []) if x]
+            payload = {k: v for k, v in payload.items() if k not in ("supersedes", "summarizes")}
 
         # Type-aware birth confidence (only when the caller didn't specify one).
         if isinstance(payload, dict) and payload.get("confidence") in (None, ""):
@@ -289,10 +357,45 @@ class MemoryEngine:
         if "durable" not in entry.tags and _is_durable_knowledge(entry):
             entry.tags = list(entry.tags) + ["durable"]
 
+        # Standing instructions ("RULE: ...", "(user rule)") are pinned: always
+        # injected, never decayed or archived.
+        if "pinned" not in entry.tags and (
+                entry.type == "rule" or _RULE_RE.search(entry.description or "")):
+            entry.tags = list(entry.tags) + ["pinned"]
+
+        # Ticket reference and git context (where/when this was learned).
+        if not entry.task:
+            entry.task = _extract_task(" ".join([entry.description or "", entry.cause or ""]))
+        if not entry.branch:
+            try:
+                from .gitinfo import current as _git_current
+                entry.branch, entry.commit = _git_current(self.storage.data_dir.name)
+            except Exception:
+                pass
+
         memory = self._read_memory()
         existing_entries = [MemoryEntry.from_dict(e) for e in memory]
 
+        superseded_ids = [i for i in (self._resolve_in(memory, r) for r in raw_supersedes) if i]
+        card_source_ids = [i for i in (self._resolve_in(memory, r) for r in raw_summarizes) if i]
+        entry.supersedes = superseded_ids
+        entry.summarizes = card_source_ids
+        if card_source_ids:  # a knowledge card: durable by definition
+            entry.tags = list(dict.fromkeys(list(entry.tags) + ["card", "durable"]))
+
         self.updater.merge_entry(memory, entry)
+
+        # Correction chain: the entries this one replaces stop being current.
+        now_iso = _now()
+        for e in memory:
+            if e.get("id") in superseded_ids:
+                e["status"] = "superseded"
+                e["superseded_by"] = entry.id
+                e["valid_to"] = now_iso
+            elif e.get("id") in card_source_ids:
+                tags = e.get("tags") or []
+                if "carded" not in tags:
+                    e["tags"] = list(tags) + ["carded"]
 
         # Conflict detection — bounded: one add can legitimately conflict with
         # at most a few prior entries; recording every match floods the queue
@@ -301,9 +404,13 @@ class MemoryEngine:
         # entry is a near-copy of its relatives by construction, so checking it
         # re-mints duplicate conflicts and feeds the merge loop its own output
         # (a real store exploded 42 -> 978 entries before this guard existed).
-        if getattr(self, "_auto_merging", False):
+        if (getattr(self, "_auto_merging", False)
+                or "session-summary" in entry.tags or entry.summarizes):
+            # merge output, session digests and knowledge cards are derived
+            # from existing entries - comparing them back is pure noise
             conflicts = []
         else:
+            existing_entries = [x for x in existing_entries if x.id not in superseded_ids]
             conflicts = find_conflicts_for(entry, existing_entries)
             conflicts.sort(key=lambda c: float(getattr(c, "similarity", 0.0)), reverse=True)
             conflicts = conflicts[: self._MAX_NEW_CONFLICTS_PER_ADD]
@@ -336,6 +443,12 @@ class MemoryEngine:
             affected=[entry.id] + [c.entry_b for c in conflicts],
             reason=f"new {entry.type}; {len(conflicts)} conflict(s) detected",
         )
+        if superseded_ids:
+            self._log("supersede", [entry.id] + superseded_ids,
+                      "{} supersedes {} entr(ies)".format(entry.id, len(superseded_ids)))
+        if card_source_ids:
+            self._log("add_card", [entry.id] + card_source_ids,
+                      "knowledge card consolidating {} entr(ies)".format(len(card_source_ids)))
 
         # Revert pattern detection 
         revert_warning = None
@@ -403,7 +516,32 @@ class MemoryEngine:
             "created_links":   created_links,
             "suggested_links": suggested_links,
             "auto_merged":     auto_merged,
+            "superseded":      superseded_ids,
         }
+
+    # ---------- id resolution ----------
+
+    @staticmethod
+    def _resolve_in(memory: List[Dict[str, Any]], ref: str) -> Optional[str]:
+        """Full id for an exact id or a unique prefix (6+ chars); else None."""
+        ref = (ref or "").strip().strip("[]")
+        if not ref:
+            return None
+        ids = [e.get("id", "") for e in memory]
+        if ref in ids:
+            return ref
+        if len(ref) >= 6:
+            hits = [i for i in ids if i.startswith(ref)]
+            if len(hits) == 1:
+                return hits[0]
+        return None
+
+    def resolve_id(self, ref: str) -> str:
+        """Public id resolution; raises KeyError when unknown or ambiguous."""
+        full = self._resolve_in(self._read_memory(), ref)
+        if full is None:
+            raise KeyError(f"entry not found (or ambiguous prefix): {ref}")
+        return full
 
     def _auto_merge_duplicates(self, conflict_dicts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Resolve duplicate-kind conflicts (sim >= _AUTO_MERGE_SIM) via merge.
@@ -535,6 +673,9 @@ class MemoryEngine:
             if stored >= DETECTOR_VERSION:
                 return
 
+            # v3: the function extractor used to store prose words (RULE,
+            # DECISION, text) as functions; clean them before replaying.
+            self._clean_function_names()
             result = self.recompute_unstable(dry_run=False)
 
             wiki_meta = self.storage.read(WIKI_FILE, default={})
@@ -689,6 +830,11 @@ class MemoryEngine:
             )
             rolled = self._rollup_session_summaries(keep=self._SESSION_SUMMARY_KEEP)
             archived = self._archive_stale_entries()
+            self._enforce_slow_floor()
+            try:
+                self.storage.snapshot()  # one consistent copy per day, 14 kept
+            except Exception:
+                pass
 
             wiki_meta = self.storage.read(WIKI_FILE, default={})
             wiki_meta["last_hygiene_run"] = now.isoformat()
@@ -727,9 +873,9 @@ class MemoryEngine:
             if e.get("status") != "active":
                 continue
             tags = e.get("tags") or []
-            if "archived" in tags or "durable" in tags:
+            if "archived" in tags or "durable" in tags or "pinned" in tags:
                 continue
-            if e.get("type") == "decision":
+            if e.get("type") in ("decision", "rule"):
                 continue
             if int(e.get("usage_count") or 0) > 0:
                 continue
@@ -749,6 +895,268 @@ class MemoryEngine:
         if archived_ids:
             self.storage.write(MEMORY_FILE, memory)
         return len(archived_ids)
+
+    # ---------- safety floor for decisions / durable knowledge ----------
+
+    def _enforce_slow_floor(self) -> int:
+        """Lift decisions and durable entries that sank below the slow-class
+        floor (unless explicitly rejected). Decay only ever lowers stored
+        confidence, so entries floored before the durable tag existed need this
+        one corrective step; afterwards the decay formula holds the floor."""
+        from .decay import SLOW_MIN_CONFIDENCE, is_slow, is_pinned
+        memory = self._read_memory()
+        lifted = 0
+        for e in memory:
+            if e.get("status") not in ("active", "conflict"):
+                continue
+            if not is_slow(e) or is_pinned(e) or "rejected" in (e.get("tags") or []):
+                continue
+            if float(e.get("confidence") or 0.5) < SLOW_MIN_CONFIDENCE:
+                e["confidence"] = SLOW_MIN_CONFIDENCE
+                e["confidence_base"] = SLOW_MIN_CONFIDENCE
+                lifted += 1
+        if lifted:
+            self.storage.write(MEMORY_FILE, memory)
+            self._log("enforce_slow_floor", [],
+                      "lifted {} decision/durable entr(ies) to the {} floor".format(
+                          lifted, SLOW_MIN_CONFIDENCE))
+        return lifted
+
+    def _clean_function_names(self) -> int:
+        """Drop prose words that an older extractor stored as function names
+        (RULE, DECISION, text, bars ...). Explicit identifiers are untouched."""
+        memory = self._read_memory()
+        changed = 0
+        for e in memory:
+            funcs = e.get("functions") or []
+            keep = []
+            for f in funcs:
+                base = str(f).rsplit("::", 1)[-1]
+                prose = (base.lower() in _PROSE_WORDS
+                         or (base.isupper() and "_" not in base and "::" not in str(f)))
+                if not prose:
+                    keep.append(f)
+            if len(keep) != len(funcs):
+                e["functions"] = keep
+                changed += 1
+        if changed:
+            self.storage.write(MEMORY_FILE, memory)
+            self._log("clean_function_names", [],
+                      "removed prose words from the functions of {} entr(ies)".format(changed))
+        return changed
+
+    # ---------- correction chains, pins, moves ----------
+
+    def supersede(self, old_ref: str, new_ref: str, reason: str = "") -> Dict[str, Any]:
+        """Mark ``old`` as replaced by ``new`` (both must already exist)."""
+        memory = self._read_memory()
+        old_id = self._resolve_in(memory, old_ref)
+        new_id = self._resolve_in(memory, new_ref)
+        if not old_id or not new_id or old_id == new_id:
+            raise KeyError(f"cannot supersede {old_ref} with {new_ref}")
+        now_iso = _now()
+        for e in memory:
+            if e.get("id") == old_id:
+                e["status"] = "superseded"
+                e["superseded_by"] = new_id
+                e["valid_to"] = now_iso
+            elif e.get("id") == new_id:
+                sup = list(e.get("supersedes") or [])
+                if old_id not in sup:
+                    sup.append(old_id)
+                e["supersedes"] = sup
+        self.storage.write(MEMORY_FILE, memory)
+        self._log("supersede", [new_id, old_id], reason or f"{new_id} supersedes {old_id}")
+        return {"old": old_id, "new": new_id}
+
+    def set_pinned(self, ref: str, pinned: bool = True) -> Dict[str, Any]:
+        """Pin/unpin an entry: pinned entries are injected into every session
+        and never decay or get archived."""
+        memory = self._read_memory()
+        eid = self._resolve_in(memory, ref)
+        if not eid:
+            raise KeyError(f"entry not found: {ref}")
+        for e in memory:
+            if e.get("id") == eid:
+                tags = [t for t in (e.get("tags") or []) if t != "pinned"]
+                if pinned:
+                    tags.append("pinned")
+                e["tags"] = tags
+        self.storage.write(MEMORY_FILE, memory)
+        self._log("pin" if pinned else "unpin", [eid], "pinned" if pinned else "unpinned")
+        return {"id": eid, "pinned": pinned}
+
+    def move_entries(self, refs: List[str], target_data_dir) -> Dict[str, Any]:
+        """Relocate entries into another project store (ids are preserved).
+
+        Repairs mis-filed knowledge: before stores were auto-provisioned, work
+        in an unconnected folder was written to a shared 'default' store where
+        three unrelated projects ended up mixed and never injected."""
+        memory = self._read_memory()
+        ids = {i for i in (self._resolve_in(memory, r) for r in refs) if i}
+        moving = [e for e in memory if e.get("id") in ids]
+        if not moving:
+            return {"moved": 0, "target": str(target_data_dir)}
+        target = MemoryEngine(target_data_dir)
+        tmem = target._read_memory()
+        have = {e.get("id") for e in tmem}
+        slug = Path(target_data_dir).name
+        added = 0
+        for e in moving:
+            if e.get("id") in have:
+                continue
+            e = dict(e)
+            e["tags"] = [t for t in (e.get("tags") or []) if not str(t).startswith("project:")]
+            e["tags"].append(f"project:{slug}")
+            tmem.append(e)
+            added += 1
+        target.storage.write(MEMORY_FILE, tmem)
+        target._log("import_entries", [e.get("id", "") for e in moving],
+                    "received {} entr(ies) from store '{}'".format(added, self.storage.data_dir.name))
+        self.storage.write(MEMORY_FILE, [e for e in memory if e.get("id") not in ids])
+        self._log("move_entries", sorted(ids),
+                  "moved {} entr(ies) to store '{}'".format(len(moving), slug))
+        return {"moved": len(moving), "target": str(target_data_dir)}
+
+    # ---------- tasks ----------
+
+    def task_timeline(self, task: str) -> List[Dict[str, Any]]:
+        """Every entry about one ticket, oldest first (superseded ones included,
+        so the story of the task reads in order)."""
+        key = (task or "").strip().lstrip("#").lower()
+        if not key:
+            return []
+        out = []
+        for e in self._read_memory():
+            t = str(e.get("task") or "").lstrip("#").lower()
+            text = " ".join([e.get("description") or "", e.get("cause") or ""]).lower()
+            if t == key or _re.search(r"(?<![a-z0-9])#?" + _re.escape(key) + r"(?![a-z0-9])", text):
+                out.append(e)
+        out.sort(key=lambda e: e.get("timestamp") or "")
+        return out
+
+    # ---------- consolidation (knowledge cards) ----------
+
+    def consolidation_candidates(self, min_entries: int = 8, max_clusters: int = 6) -> List[Dict[str, Any]]:
+        """Clusters of entries about one file that have grown large enough to be
+        distilled into a single knowledge card (written by the agent, via
+        add_memory(..., summarizes=[ids])). Carded entries are not offered again."""
+        skip_tags = {"archived", "card", "carded", "session-summary", "pinned"}
+        pool = [e for e in self._read_memory()
+                if e.get("status") in ("active", "conflict")
+                and e.get("type") != "rule"
+                and not (skip_tags & set(e.get("tags") or []))]
+        clusters: List[Dict[str, Any]] = []
+        while pool and len(clusters) < max_clusters:
+            counts: Dict[str, int] = {}
+            for e in pool:
+                for f in set(e.get("files") or []):
+                    if f:
+                        counts[f] = counts.get(f, 0) + 1
+            if not counts:
+                break
+            surface, n = max(counts.items(), key=lambda kv: kv[1])
+            if n < min_entries:
+                break
+            members = [e for e in pool if surface in (e.get("files") or [])]
+            members.sort(key=lambda e: e.get("timestamp") or "")
+            clusters.append({
+                "surface": surface,
+                "count": len(members),
+                "entries": [{
+                    "id": e.get("id"), "type": e.get("type"),
+                    "confidence": e.get("confidence"),
+                    "timestamp": (e.get("timestamp") or "")[:10],
+                    "description": e.get("description") or "",
+                    "fix": (e.get("fix") or "")[:400],
+                } for e in members],
+            })
+            gone = {e.get("id") for e in members}
+            pool = [e for e in pool if e.get("id") not in gone]
+        return clusters
+
+    # ---------- automatic session digest (SessionEnd hook) ----------
+
+    def auto_session_summary(self, min_entries: int = 2, window_hours: float = 18.0) -> Optional[Dict[str, Any]]:
+        """Write a digest of what was recorded since the last session summary.
+
+        Called by the SessionEnd hook, so the hand-off note exists without
+        anyone remembering /memsession (used once in two months). The newest
+        digest is shown at the next session start as "Last session"."""
+        from datetime import timedelta
+        memory = self._read_memory()
+        now = datetime.now(timezone.utc)
+        last = max((e.get("timestamp") or "" for e in memory
+                    if "session-summary" in (e.get("tags") or [])), default="")
+        cutoff = max(last, (now - timedelta(hours=window_hours)).isoformat())
+        fresh = [e for e in memory
+                 if (e.get("timestamp") or "") > cutoff
+                 and e.get("status") in ("active", "conflict")
+                 and "session-summary" not in (e.get("tags") or [])]
+        if len(fresh) < min_entries:
+            return None
+        fresh.sort(key=lambda e: e.get("timestamp") or "")
+        files: List[str] = []
+        funcs: List[str] = []
+        for e in fresh:
+            for f in e.get("files") or []:
+                if f not in files:
+                    files.append(f)
+            for fn in e.get("functions") or []:
+                if fn not in funcs:
+                    funcs.append(fn)
+        head = "; ".join((e.get("description") or "")[:60] for e in fresh[:3])
+        lines = ["- ({}) {}".format(e.get("type"), (e.get("description") or "")[:120])
+                 for e in fresh[-15:]]
+        result = self.add_memory({
+            "type": "note",
+            "description": "Session {}: {} entries - {}".format(
+                now.strftime("%Y-%m-%d %H:%M"), len(fresh), head)[:300],
+            "cause": "automatic end-of-session digest",
+            "fix": "\n".join(lines),
+            "files": files[:30],
+            "functions": funcs[:30],
+            "confidence": 0.6,
+            "tags": ["session-summary", "auto"],
+        })
+        self._log("session_summary", [result["entry"]["id"]],
+                  "auto digest of {} entr(ies)".format(len(fresh)))
+        self._rollup_session_summaries(keep=self._SESSION_SUMMARY_KEEP)
+        return result
+
+    def warm_embeddings(self) -> int:
+        """Make sure every live entry's vectors are in the disk cache.
+
+        Conflict detection, dedup and link suggestion embed three text views of
+        each entry with the similarity model; search embeds a fourth with the
+        retrieval model. Uncached, the first add or query after a restart pays
+        for the whole store (28 s on a 500-entry store). The daemon calls this
+        in the background so no interactive operation ever does.
+        """
+        from . import embeddings
+        from .conflict import _combined_text
+        from .deduplicator import _entry_text
+        from .dependency_graph import _full_text
+        from .search import entry_text
+        live = [e for e in self._read_memory() if e.get("status") in ("active", "conflict")]
+        sim: List[str] = []
+        for e in live:
+            try:
+                sim.append(_combined_text(MemoryEntry.from_dict(e)))
+            except Exception:
+                pass
+            sim.append(_entry_text(e))
+            try:
+                sim.append(_full_text(e))
+            except Exception:
+                pass
+        sim = list(dict.fromkeys(t for t in sim if t))
+        for i in range(0, len(sim), 64):
+            embeddings.embed_batch(sim[i:i + 64])
+        ret = [entry_text(e) for e in live]
+        for i in range(0, len(ret), 64):
+            embeddings.embed_passages(ret[i:i + 64])
+        return len(live)
 
     def run_daily_maintenance(self) -> None:
         """Run every daily-guarded maintenance hook. Called from READ paths
@@ -1146,26 +1554,24 @@ class MemoryEngine:
 
         scored: List[tuple[float, Dict[str, Any]]] = []
         from .decay import entry_effective_confidence as _entry_eff
+        from .search import rank as _rank
         from datetime import datetime, timezone as _tz
         _now = datetime.now(_tz.utc)
         _sorted_ts = sorted(e.get("timestamp") or "" for e in memory)
 
-        for e in memory:
-            # Index over description + cause + fix + decisions for richer matching
-            decisions_text = " ".join(e.get("decisions", []))
-            text = " ".join(filter(None, [
-                e.get("description", ""),
-                e.get("cause", ""),
-                e.get("fix", ""),
-                decisions_text,
-            ]))
-            sem_score = similarity(query, text)
-            # Blend semantic score with decayed confidence so stale entries rank lower.
-            # Weight: 90% semantic + 10% decayed confidence — keeps relevance dominant.
-            # entry_effective_confidence applies activity-relative aging and the
-            # decision half-life bonus (one formula shared with DecayEngine).
+        # A superseded entry has been replaced by a correction - returning it
+        # next to (or above) its replacement is how stale facts resurface.
+        memory = [e for e in memory if e.get("status") != "superseded"]
+
+        # Hybrid relevance: BM25 over symbols/description/body + multilingual
+        # embeddings (one implementation shared with the recall hook).
+        ranked = _rank(memory, query)
+        for e, r in zip(memory, ranked):
+            # Weight: 90% relevance + 10% decayed confidence - keeps relevance
+            # dominant. entry_effective_confidence applies activity-relative
+            # aging and the decision/usage bonuses (shared with DecayEngine).
             conf_factor = _entry_eff(e, sorted_timestamps=_sorted_ts, now=_now)
-            score = sem_score * 0.9 + conf_factor * 0.1
+            score = r["relevance"] * 0.9 + conf_factor * 0.1
             scored.append((score, e))
 
         # Recency tiebreak: entries tied on score (common at the confidence
@@ -1278,12 +1684,15 @@ class MemoryEngine:
         from datetime import datetime, timezone as _tz
         d = self._REINFORCE_DELTA if delta is None else float(delta)
         memory = self._read_memory()
+        entry_id = self._resolve_in(memory, entry_id) or entry_id
         now_iso = datetime.now(_tz.utc).isoformat()
         found = None
         for e in memory:
             if e.get("id") == entry_id:
                 old = float(e.get("confidence") or 0.5)
                 e["confidence"] = round(min(self._REINFORCE_CAP, old + d), 4)
+                if "rejected" in (e.get("tags") or []):
+                    e["tags"] = [t for t in e["tags"] if t != "rejected"]
                 # A deliberate confidence change sets a new decay baseline.
                 e["confidence_base"] = e["confidence"]
                 e["usage_count"] = int(e.get("usage_count") or 0) + 1
@@ -1304,11 +1713,15 @@ class MemoryEngine:
         """Reject a memory: lower confidence toward the floor (it misled you)."""
         d = self._WEAKEN_DELTA if delta is None else float(delta)
         memory = self._read_memory()
+        entry_id = self._resolve_in(memory, entry_id) or entry_id
         found = None
         for e in memory:
             if e.get("id") == entry_id:
                 old = float(e.get("confidence") or 0.5)
                 e["confidence"] = round(max(self._CONF_FLOOR, old - d), 4)
+                # An explicit rejection lifts the durable/decision safety floor.
+                if "rejected" not in (e.get("tags") or []):
+                    e["tags"] = list(e.get("tags") or []) + ["rejected"]
                 # A deliberate confidence change sets a new decay baseline.
                 e["confidence_base"] = e["confidence"]
                 found = {"id": entry_id, "old": old, "new": e["confidence"]}

@@ -80,6 +80,22 @@ DECISION_HALF_LIFE_MULT: float = 4.0
 # structurally slower, not just start a little higher.
 USAGE_HALF_LIFE_BONUS: float = 0.5
 
+# Decisions and durable knowledge never sink below this unless a human/agent
+# explicitly rejected them. Audit #4: an "ARCHITECTURE: ..." note carried the
+# durable tag at confidence 0.25 - slow decay alone cannot lift what already
+# fell, and 0.25 loses every ranking it enters.
+SLOW_MIN_CONFIDENCE: float = 0.45
+
+
+def is_pinned(entry: Dict[str, Any]) -> bool:
+    """Rules and pinned entries are standing instructions: they do not age."""
+    return entry.get("type") == "rule" or "pinned" in (entry.get("tags") or [])
+
+
+def is_slow(entry: Dict[str, Any]) -> bool:
+    return (entry.get("type") == "decision"
+            or "durable" in (entry.get("tags") or []))
+
 
 def activity_age_days(
     wall_age_days: float,
@@ -157,6 +173,8 @@ def entry_effective_confidence(
       * decisions decay DECISION_HALF_LIFE_MULT times slower
       * each confirmed use extends the half-life (USAGE_HALF_LIFE_BONUS)
     """
+    if is_pinned(entry):
+        return float(entry.get("confidence") or 0.5)
     anchor = _anchor_ts(entry)
     # Slow-decay class: explicit decisions AND entries tagged 'durable'
     # (architectural facts, root causes, environment constraints — knowledge
@@ -164,10 +182,9 @@ def entry_effective_confidence(
     # Audit #3: the most valuable notes in a real store (ARCHITECTURE…,
     # "is NOT a ScanScore bug", build-env constraints) were sinking to the
     # floor within weeks because "note" conflates scratch with gold.
-    slow = (
-        entry.get("type") == "decision"
-        or "durable" in (entry.get("tags") or [])
-    )
+    slow = is_slow(entry)
+    if slow and "rejected" not in (entry.get("tags") or []):
+        min_confidence = max(min_confidence, SLOW_MIN_CONFIDENCE)
     hl = half_life_days * (DECISION_HALF_LIFE_MULT if slow else 1.0)
     usage = int(entry.get("usage_count") or 0)
     if usage > 0:
@@ -265,7 +282,7 @@ class DecayEngine:
         skipped_count = 0
 
         for e in memory:
-            if e.get("status") in _EXEMPT_STATUS:
+            if e.get("status") in _EXEMPT_STATUS or is_pinned(e):
                 skipped_count += 1
                 continue
 

@@ -59,14 +59,8 @@ class Linter:
     # ── IO ────────────────────────────────────────────────────────────────
 
     def _read(self, name: str, default: Any) -> Any:
-        path = self.data_dir / name
-        if not path.exists():
-            return default
-        try:
-            with path.open("r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            return default
+        from .storage import read_store
+        return read_store(self.data_dir, name, default)
 
     # ── individual checks ─────────────────────────────────────────────────
 

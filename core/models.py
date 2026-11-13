@@ -6,7 +6,8 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 
-VALID_TYPES = {"bug_fix", "feature", "note", "decision"}
+# "rule": a standing instruction from the user/client - pinned, never decays.
+VALID_TYPES = {"bug_fix", "feature", "note", "decision", "rule"}
 VALID_STATUS = {"active", "resolved", "conflict", "superseded"}
 
 
@@ -51,6 +52,20 @@ class MemoryEntry:
     # from the already-decayed confidence (prevents compounding). 0.0 = unset;
     # reinforce/weaken/update_confidence establish a new baseline.
     confidence_base: float = 0.0
+    # ── knowledge layer ──────────────────────────────────────────────────
+    # Correction chain: ids this entry replaces / the id that replaced it,
+    # and when this entry stopped being true (set when it is superseded).
+    supersedes: List[str] = field(default_factory=list)
+    superseded_by: str = ""
+    valid_to: str = ""
+    # Where the knowledge was learned: git branch + short commit at write time.
+    # Lets recall flag facts that come from another, possibly unmerged branch.
+    branch: str = ""
+    commit: str = ""
+    # Ticket / task reference (e.g. "#1145", "SS-809").
+    task: str = ""
+    # Knowledge card: ids of the entries this card consolidates.
+    summarizes: List[str] = field(default_factory=list)
 
     def validate(self) -> None:
         if self.type not in VALID_TYPES:
@@ -89,6 +104,11 @@ class MemoryEntry:
         clean.setdefault("test_ids", [])
         clean.setdefault("usage_count", 0)
         clean.setdefault("last_used", "")
+        for key in ("supersedes", "summarizes"):
+            if not isinstance(clean.get(key), list):
+                clean[key] = []
+        for key in ("superseded_by", "valid_to", "branch", "commit", "task"):
+            clean[key] = str(clean.get(key) or "")
         return cls(**clean)
 
 

@@ -52,3 +52,11 @@ tests/test_revert_detector.py
 tests/test_revert_detector.py
 tests/test_decay.py
 tests/test_decay.py
+
+# SQLite stores, snapshots, embedding cache and daemon state (runtime data)
+data/memory.db*
+data/embeddings.db*
+data/.snapshots/
+data/legacy_json/
+data/daemon.json
+data/daemon.spawn

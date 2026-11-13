@@ -22,6 +22,10 @@ The project is resolved automatically from the current working directory.
 | `/memrecompute [--apply]` | Clear false-positive unstable tags |
 | `/memwiki` | Render Markdown wiki |
 | `/memui [--port N]` | Open **web dashboard** in browser |
+| `/memtask <id>` | Timeline of one task/ticket (e.g. `1145`, `SS-809`) |
+| `/mempin <id> [--unpin]` | Pin a memory: always injected, never decays |
+| `/memsupersede <old> <new>` | Mark an entry as replaced by a newer one |
+| `/memconsolidate` | Distil big per-file clusters into knowledge cards |
 
 ## Workflow
 

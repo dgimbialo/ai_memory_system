@@ -44,7 +44,7 @@ for _stream in (sys.stdin, sys.stdout, sys.stderr):
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "ai-memory"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "2.0.0"
 
 
 # ── diagnostics (stderr only — never pollute the stdio channel) ───────────────
@@ -61,18 +61,23 @@ def _slug(name: str) -> str:
 
 
 def _resolve_data_dir() -> Path:
+    """Which store does this server instance serve?
+
+    1. AI_MEMORY_DATA_DIR - explicit path.
+    2. AI_MEMORY_PROJECT  - slug pinned by a project-level config (connect.py).
+    3. The working directory, via core.project_resolve: a registered project
+       that contains it, else its git root (store auto-provisioned and
+       registered). Anything else is the shared root store.
+    """
     explicit = os.environ.get("AI_MEMORY_DATA_DIR")
     if explicit:
         return Path(explicit)
     project = os.environ.get("AI_MEMORY_PROJECT")
-    if project:
+    if project and _slug(project) != "default":
         return ROOT / "data" / "projects" / _slug(project)
-    cwd_name = Path.cwd().name
-    if cwd_name:
-        candidate = ROOT / "data" / "projects" / _slug(cwd_name)
-        if candidate.exists():
-            return candidate
-    return ROOT / "data"
+    from core.project_resolve import resolve
+    slug = resolve(Path.cwd(), allow_plain_dir=False)
+    return ROOT / "data" / "projects" / slug if slug else ROOT / "data"
 
 
 _ENGINE = None
@@ -86,6 +91,14 @@ def _engine():
 
         data_dir = _resolve_data_dir()
         _log(f"using data dir: {data_dir}")
+        # Cache misses are encoded by the local daemon (warm models) instead of
+        # loading a model into this process; falls back to local when it is down.
+        try:
+            from core import embeddings, daemon_client
+            embeddings.use_daemon(True)
+            daemon_client.ensure_daemon()
+        except Exception:
+            pass
         _ENGINE = MemoryEngine(data_dir)
     return _ENGINE
 
@@ -119,7 +132,8 @@ TOOLS: List[Dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "type": {"type": "string", "enum": ["bug_fix", "feature", "decision", "note"]},
+                "type": {"type": "string", "enum": ["bug_fix", "feature", "decision", "note", "rule"],
+                         "description": "Use 'rule' for a standing instruction from the user/client: it is pinned into every session and never decays."},
                 "description": {"type": "string", "description": "One-line summary of what happened."},
                 "cause": {"type": "string", "description": "Root cause (for bug_fix) or motivation."},
                 "fix": {"type": "string", "description": "What was changed / decided."},
@@ -127,6 +141,11 @@ TOOLS: List[Dict[str, Any]] = [
                 "functions": {"type": "array", "items": {"type": "string"}, "description": "Functions/symbols touched."},
                 "tags": {"type": "array", "items": {"type": "string"}},
                 "decisions": {"type": "array", "items": {"type": "string"}},
+                "supersedes": {"type": "array", "items": {"type": "string"},
+                               "description": "Ids (8-char prefixes are fine) of entries this one corrects or replaces. They are marked superseded and stop being recalled."},
+                "task": {"type": "string", "description": "Ticket/task reference, e.g. '#1145' or 'SS-809'."},
+                "summarizes": {"type": "array", "items": {"type": "string"},
+                               "description": "For a knowledge card: ids of the entries this card consolidates (see memory_consolidate)."},
             },
             "required": ["type", "description"],
         },
@@ -170,6 +189,51 @@ TOOLS: List[Dict[str, Any]] = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "memory_resolve",
+        "description": (
+            "Resolve an open conflict between two memories (see memory_conflicts). "
+            "You have the context to judge - do not leave conflicts open. "
+            "action: supersede_a (B is right), supersede_b (A is right), merge "
+            "(same knowledge, combine), dismiss (not actually a conflict)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Conflict id (prefix is fine)."},
+                "action": {"type": "string", "enum": ["supersede_a", "supersede_b", "merge", "dismiss"]},
+                "reason": {"type": "string"},
+            },
+            "required": ["id", "action"],
+        },
+    },
+    {
+        "name": "memory_pin",
+        "description": "Pin (or unpin) a memory: pinned entries are shown at every session start and never decay. Use for standing rules.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "string"}, "pinned": {"type": "boolean", "default": True}},
+            "required": ["id"],
+        },
+    },
+    {
+        "name": "memory_task",
+        "description": "Timeline of everything recorded about one task/ticket (e.g. '1145' or 'SS-809'), oldest first.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"task": {"type": "string"}},
+            "required": ["task"],
+        },
+    },
+    {
+        "name": "memory_consolidate",
+        "description": (
+            "List clusters of entries about one file that are large enough to be distilled into a "
+            "single knowledge card. For each cluster, write the card with memory_add(type='note', "
+            "summarizes=[ids...]) - a compact, current statement of what is true about that file."
+        ),
+        "inputSchema": {"type": "object", "properties": {"min_entries": {"type": "integer", "default": 8}}},
+    },
+    {
         "name": "memory_stats",
         "description": "Summary of the project's memory store: counts by type/status, conflicts, store health.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -183,7 +247,7 @@ TOOLS: List[Dict[str, Any]] = [
 # later saves a memory whose files overlap a recalled entry, that entry proved
 # relevant — auto-reinforce it. This closes the feedback loop that manual
 # memory_confirm never closed in practice (usage_count was 0 across all stores).
-_SESSION_RECALLS: Dict[str, set] = {}
+_SESSION_RECALLS: Dict[str, Dict[str, set]] = {}
 # +0.05 per confirmed reuse (audit #2: +0.02 x 30 events was noise against the
 # daily decay pull). Combined with the usage_count half-life bonus in decay.py.
 _AUTO_REINFORCE_DELTA: float = 0.05
@@ -207,9 +271,10 @@ def _tool_memory_query(args: Dict[str, Any]) -> str:
     # Remember what was recalled this session for auto-reinforcement.
     for r in results:
         files = {f.lower() for f in (r.get("files") or [])}
-        if files:
-            _SESSION_RECALLS[r["id"]] = files
-    # Reads also keep the store healthy — maintenance must not freeze in
+        funcs = {f.lower() for f in (r.get("functions") or [])}
+        if files or funcs:
+            _SESSION_RECALLS[r["id"]] = {"files": files, "functions": funcs}
+    # Reads also keep the store healthy - maintenance must not freeze in
     # read-only phases (all hooks are daily-guarded, so this is cheap).
     try:
         eng.run_daily_maintenance()
@@ -220,12 +285,30 @@ def _tool_memory_query(args: Dict[str, Any]) -> str:
         tags = ", ".join(r.get("tags", []))
         unstable = "  ⚠ UNSTABLE (repeatedly reverted)" if "unstable" in r.get("tags", []) else ""
         lines.append(
-            f"• [{r['score']}] ({r.get('type')}, {r.get('status')}) {r.get('description')}{unstable}\n"
+            f"• [{r['id'][:8]}] score={r['score']} ({r.get('type')}, {r.get('status')}) "
+            f"{r.get('description')}{unstable}\n"
             f"    fix: {r.get('fix_summary', '')}\n"
             f"    files: {', '.join(r.get('files', []))}"
             + (f"\n    tags: {tags}" if tags else "")
         )
+    lines.append("\n(memory_confirm <id> when an entry proves right, memory_reject <id> when it is wrong; "
+                 "to correct one, memory_add with supersedes=[id])")
     return "\n".join(lines)
+
+
+def _file_frequencies(eng):
+    """(file -> number of live entries touching it, number of live entries)."""
+    counts: Dict[str, int] = {}
+    n = 0
+    try:
+        for e in eng.list_memory():
+            if e.get("status") in ("active", "conflict"):
+                n += 1
+                for f in set(e.get("files") or []):
+                    counts[f.lower()] = counts.get(f.lower(), 0) + 1
+    except Exception:
+        pass
+    return counts, n
 
 
 def _tool_memory_add(args: Dict[str, Any]) -> str:
@@ -238,34 +321,51 @@ def _tool_memory_add(args: Dict[str, Any]) -> str:
         "functions": args.get("functions", []) or [],
         "tags": (args.get("tags", []) or []) + ["mcp"],
         "decisions": args.get("decisions", []) or [],
+        "supersedes": args.get("supersedes", []) or [],
+        "summarizes": args.get("summarizes", []) or [],
+        "task": str(args.get("task", "") or ""),
         "status": "active",
     }
     eng = _engine()
     result = eng.add_memory(payload)
     entry = result.get("entry", {})
     msg = f"✅ Saved memory {entry.get('id', '?')} ({entry.get('type')})."
+    if result.get("superseded"):
+        msg += "\n↪ Superseded: " + ", ".join(i[:8] for i in result["superseded"]) + " (no longer recalled)."
+    if entry.get("summarizes"):
+        msg += f"\n🗂 Knowledge card created over {len(entry['summarizes'])} entr(ies)."
+    if "pinned" in (entry.get("tags") or []):
+        msg += "\n📌 Pinned: shown at every session start, never decays."
     if result.get("revert_warning"):
         msg += "\n⚠ " + result["revert_warning"].get("message", "Revert pattern detected.")
     for m in result.get("auto_merged") or []:
-        msg += (f"\n🔀 Near-duplicate of an existing memory — merged into "
+        msg += (f"\n🔀 Near-duplicate of an existing memory - merged into "
                 f"{m.get('merged_entry_id', '?')[:8]} (both originals superseded).")
 
-    # Auto-reinforce recalled memories whose surface the agent just re-edited:
-    # the recall demonstrably informed real work, which is the strongest
-    # relevance signal we can get without asking anyone.
+    # Auto-reinforce recalled memories whose surface the agent just re-edited.
+    # Evidence must be specific: a shared function, or a shared file that few
+    # entries touch. Overlap on a hot file proves nothing - in one store 77% of
+    # all entries touched a hot file, and umbrella entries with long file lists
+    # collected reinforcement from every unrelated add (audit #4).
     new_files = {f.lower() for f in (payload["files"] or [])}
-    if new_files and _SESSION_RECALLS:
+    new_funcs = {f.lower() for f in (entry.get("functions") or [])}
+    if (new_files or new_funcs) and _SESSION_RECALLS:
+        df, n_live = _file_frequencies(eng)
+        rare_max = max(8, int(0.03 * n_live))
         reinforced = 0
-        for eid, files in list(_SESSION_RECALLS.items()):
+        for eid, surf in list(_SESSION_RECALLS.items()):
             if reinforced >= _AUTO_REINFORCE_MAX_PER_ADD:
                 break
             if eid == entry.get("id"):
                 continue
-            if new_files & files:
+            shared_funcs = new_funcs & surf["functions"]
+            shared_rare = {f for f in (new_files & surf["files"]) if df.get(f, 0) <= rare_max}
+            if shared_funcs or shared_rare:
                 try:
                     eng.reinforce(
                         eid, delta=_AUTO_REINFORCE_DELTA,
-                        reason="auto: recalled entry's files re-edited this session",
+                        reason="auto: recalled entry's {} re-edited this session".format(
+                            "function" if shared_funcs else "file"),
                     )
                     reinforced += 1
                     del _SESSION_RECALLS[eid]  # reinforce once per session
@@ -275,11 +375,70 @@ def _tool_memory_add(args: Dict[str, Any]) -> str:
             msg += f"\n↑ Auto-reinforced {reinforced} previously recalled memor(ies) that informed this work."
 
     # Input-quality nudge: a bug_fix without a root cause is far less useful
-    # to future sessions. Don't block — just teach the agent.
+    # to future sessions. Don't block - just teach the agent.
     if payload["type"] == "bug_fix" and not (payload["cause"] or "").strip():
-        msg += ("\n💡 Tip: this bug_fix has no 'cause'. Add the root cause next time — "
+        msg += ("\n💡 Tip: this bug_fix has no 'cause'. Add the root cause next time - "
                 "it is what makes the memory valuable when the bug resurfaces.")
     return msg
+
+
+def _tool_memory_resolve(args: Dict[str, Any]) -> str:
+    cid = str(args.get("id", "")).strip()
+    action = str(args.get("action", "")).strip()
+    if not cid or not action:
+        return "Error: 'id' and 'action' are required."
+    eng = _engine()
+    ids = [c.get("id", "") for c in eng.list_conflicts()]
+    match = [i for i in ids if i == cid] or [i for i in ids if i.startswith(cid)]
+    if len(match) != 1:
+        return f"Error: conflict {cid} not found (or ambiguous). Open conflicts: {', '.join(i[:8] for i in ids) or 'none'}."
+    try:
+        r = eng.resolve_conflict(match[0], action=action, reason=str(args.get("reason", "") or "resolved via MCP"))
+    except (KeyError, ValueError) as exc:
+        return f"Error: {exc}"
+    return f"✅ Conflict {match[0][:8]} resolved ({action}); affected: {', '.join(i[:8] for i in r.get('affected_entries', []))}."
+
+
+def _tool_memory_pin(args: Dict[str, Any]) -> str:
+    eid = str(args.get("id", "")).strip()
+    if not eid:
+        return "Error: 'id' is required."
+    try:
+        r = _engine().set_pinned(eid, bool(args.get("pinned", True)))
+    except KeyError:
+        return f"Error: no memory with id {eid}."
+    return f"📌 {r['id'][:8]} {'pinned' if r['pinned'] else 'unpinned'}."
+
+
+def _tool_memory_task(args: Dict[str, Any]) -> str:
+    task = str(args.get("task", "")).strip()
+    if not task:
+        return "Error: 'task' is required."
+    items = _engine().task_timeline(task)
+    if not items:
+        return f"No memories mention task {task}."
+    lines = [f"Task {task}: {len(items)} entr(ies), oldest first"]
+    for e in items:
+        lines.append(f"• {(e.get('timestamp') or '')[:10]} [{e.get('id', '?')[:8]}] ({e.get('type')}, "
+                     f"{e.get('status')}) {(e.get('description') or '')[:160]}")
+    return "\n".join(lines)
+
+
+def _tool_memory_consolidate(args: Dict[str, Any]) -> str:
+    clusters = _engine().consolidation_candidates(min_entries=int(args.get("min_entries", 8) or 8))
+    if not clusters:
+        return "Nothing to consolidate: no file has enough un-carded entries."
+    lines = [f"{len(clusters)} cluster(s) ready for a knowledge card. For each: read the entries, then "
+             "memory_add(type='note', description='CARD <file>: ...', fix='<what is currently true>', "
+             "files=[file], summarizes=[all ids]).\n"]
+    for c in clusters:
+        lines.append(f"## {c['surface']}  ({c['count']} entries)")
+        for e in c["entries"]:
+            lines.append(f"- [{e['id'][:8]}] {e['timestamp']} ({e['type']}) {e['description'][:150]}")
+            if e.get("fix"):
+                lines.append(f"    fix: {e['fix'][:220]}")
+        lines.append("  ids: " + ", ".join(e["id"][:8] for e in c["entries"]))
+    return "\n".join(lines)[:24000]
 
 
 def _tool_memory_confirm(args: Dict[str, Any]) -> str:
@@ -356,6 +515,10 @@ _DISPATCH = {
     "memory_recent": _tool_memory_recent,
     "memory_conflicts": _tool_memory_conflicts,
     "memory_stats": _tool_memory_stats,
+    "memory_resolve": _tool_memory_resolve,
+    "memory_pin": _tool_memory_pin,
+    "memory_task": _tool_memory_task,
+    "memory_consolidate": _tool_memory_consolidate,
 }
 
 
